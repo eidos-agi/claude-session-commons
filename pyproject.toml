@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-session-commons"
+version = "0.1.0"
+description = "Shared session discovery, caching, and classification for Claude Code tools"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+train = ["pandas", "scikit-learn"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
