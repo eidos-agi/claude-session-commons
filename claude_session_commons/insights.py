@@ -110,7 +110,35 @@ def init_db(conn: sqlite3.Connection):
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
             embedding float[{EMBEDDING_DIM}]
         );
+
+        CREATE TABLE IF NOT EXISTS insights_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
     """)
+    conn.commit()
+    _ensure_model_provenance(conn)
+
+
+def _ensure_model_provenance(conn: sqlite3.Connection):
+    """Record current embedding model info. Called on every init_db()."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    meta = {
+        "model_name": EMBEDDING_MODEL,
+        "embedding_dim": EMBEDDING_DIM,
+        "updated_at": now,
+    }
+    for key, value in meta.items():
+        conn.execute(
+            """INSERT INTO insights_meta (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+               updated_at = excluded.updated_at""",
+            (key, str(value), now),
+        )
     conn.commit()
 
 
@@ -320,7 +348,7 @@ def query(
 # ── Stats ─────────────────────────────────────────────────────
 
 def get_stats(conn: sqlite3.Connection) -> dict:
-    """Get index statistics."""
+    """Get index statistics including model provenance."""
     total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     turns = conn.execute(
         "SELECT COUNT(*) FROM chunks WHERE chunk_type = 'turn'"
@@ -331,9 +359,20 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     sessions = conn.execute(
         "SELECT COUNT(DISTINCT session_id) FROM chunks"
     ).fetchone()[0]
+
+    # Model provenance from insights_meta
+    meta = {}
+    try:
+        rows = conn.execute("SELECT key, value FROM insights_meta").fetchall()
+        meta = {r[0]: r[1] for r in rows}
+    except Exception:
+        pass
+
     return {
         "total_chunks": total,
         "turns": turns,
         "subagent_summaries": subagents,
         "sessions_indexed": sessions,
+        "model_name": meta.get("model_name", "unknown"),
+        "embedding_dim": meta.get("embedding_dim", "unknown"),
     }

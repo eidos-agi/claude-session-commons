@@ -40,6 +40,7 @@ except ImportError:
 CLAUDE_DIR = Path.home() / ".claude"
 LOG_FILE = CLAUDE_DIR / "daemon.log"
 PID_FILE = CLAUDE_DIR / "session-daemon.pid"
+STATUS_FILE = CLAUDE_DIR / "daemon.status.json"
 RESUME_CACHE_DIR = CLAUDE_DIR / "resume-summaries"
 TASK_DIR = CLAUDE_DIR / "daemon-tasks"
 
@@ -50,6 +51,7 @@ RATE_LIMIT_SECS = 3             # pause between sessions (on top of claude -p ti
 LOOKBACK_HOURS = 720            # 30 days — only process recent sessions
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per log file
 LOG_BACKUP_COUNT = 3
+DAEMON_VERSION = "1.1.0"
 
 
 # ── Logging ──────────────────────────────────────────────────
@@ -100,6 +102,36 @@ def _write_pid():
 
 def _remove_pid():
     PID_FILE.unlink(missing_ok=True)
+
+
+# ── Status heartbeat ────────────────────────────────────────
+
+_DAEMON_STATUS = {
+    "pid": 0,
+    "version": DAEMON_VERSION,
+    "started_at": "",
+    "last_run": "",
+    "last_success": "",
+    "last_error": "",
+    "sessions_processed": 0,
+    "sessions_failed": 0,
+    "tasks_processed": 0,
+    "queue_depth": 0,
+    "insights_enabled": False,
+    "insights_chunks": 0,
+    "state": "starting",
+}
+
+
+def _write_status(status: dict | None = None):
+    """Write daemon.status.json atomically. Uses module-level _DAEMON_STATUS if none provided."""
+    data = status or _DAEMON_STATUS
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(STATUS_FILE)
+    except OSError:
+        pass  # Best-effort — don't crash the daemon over status writes
 
 
 # ── Session filtering ────────────────────────────────────────
@@ -265,10 +297,19 @@ def _process_task_files(
 
 def _run_loop(shutdown: threading.Event, logger: logging.Logger):
     """Poll-and-process loop. Runs until shutdown event is set."""
+    from datetime import datetime, timezone
+
     caches = [
         SessionCache(),
         SessionCache(RESUME_CACHE_DIR),
     ]
+
+    # Initialize status heartbeat
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _DAEMON_STATUS["pid"] = os.getpid()
+    _DAEMON_STATUS["started_at"] = now_iso
+    _DAEMON_STATUS["state"] = "starting"
+    _write_status()
 
     # Initialize insights (optional — graceful if deps missing)
     insights_conn = None
@@ -280,10 +321,14 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
             from fastembed import TextEmbedding
             insights_model = TextEmbedding("BAAI/bge-small-en-v1.5")
             logger.info("Insights enabled (sqlite-vec + fastembed)")
+            _DAEMON_STATUS["insights_enabled"] = True
         except Exception as e:
             logger.warning("Insights disabled: %s", e)
             insights_conn = None
             insights_model = None
+
+    _DAEMON_STATUS["state"] = "running"
+    _write_status()
 
     logger.info(
         "Daemon started (pid=%d, poll=%ds, idle=%ds)",
@@ -293,13 +338,17 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
     while not shutdown.is_set():
         try:
             # Priority 1: Process on-demand task requests from TUI
-            _process_task_files(caches, shutdown, logger)
+            tasks_done = _process_task_files(caches, shutdown, logger)
+            _DAEMON_STATUS["tasks_processed"] += tasks_done
 
             if shutdown.is_set():
                 break
 
             # Priority 2: Background scan for idle uncached sessions
             sessions = _find_idle_uncached(caches, logger)
+            _DAEMON_STATUS["queue_depth"] = len(sessions)
+            _DAEMON_STATUS["last_run"] = datetime.now(timezone.utc).isoformat()
+            _write_status()
 
             if sessions:
                 logger.info("Found %d sessions to process", len(sessions))
@@ -312,7 +361,8 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
                         break
 
                     # Check for TUI tasks between background sessions
-                    _process_task_files(caches, shutdown, logger)
+                    tasks_done = _process_task_files(caches, shutdown, logger)
+                    _DAEMON_STATUS["tasks_processed"] += tasks_done
 
                     success = _analyze_session(
                         s, caches, logger,
@@ -321,16 +371,37 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
                     )
                     if success:
                         ok += 1
+                        _DAEMON_STATUS["sessions_processed"] += 1
+                        _DAEMON_STATUS["last_success"] = datetime.now(timezone.utc).isoformat()
                     else:
                         fail += 1
+                        _DAEMON_STATUS["sessions_failed"] += 1
+                        _DAEMON_STATUS["last_error"] = f"Session {s['session_id'][:8]}... failed"
+
+                    _DAEMON_STATUS["queue_depth"] = max(0, _DAEMON_STATUS["queue_depth"] - 1)
+                    _write_status()
 
                     if not shutdown.is_set():
                         time.sleep(RATE_LIMIT_SECS)
 
                 logger.info("Batch complete: %d ok, %d failed", ok, fail)
 
+            # Update insights chunk count periodically
+            if insights_conn is not None:
+                try:
+                    from .insights import get_stats
+                    _DAEMON_STATUS["insights_chunks"] = get_stats(insights_conn)["total_chunks"]
+                except Exception:
+                    pass
+
+            _DAEMON_STATUS["state"] = "idle"
+            _write_status()
+
         except Exception as e:
             logger.error("Error in poll cycle: %s", e, exc_info=True)
+            _DAEMON_STATUS["last_error"] = str(e)
+            _DAEMON_STATUS["state"] = "error"
+            _write_status()
 
         # Interruptible sleep — but wake every 2s to check for TUI tasks
         elapsed = 0
@@ -338,7 +409,14 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
             shutdown.wait(TASK_POLL_SECS)
             elapsed += TASK_POLL_SECS
             if not shutdown.is_set():
-                _process_task_files(caches, shutdown, logger)
+                tasks_done = _process_task_files(caches, shutdown, logger)
+                _DAEMON_STATUS["tasks_processed"] += tasks_done
+
+        _DAEMON_STATUS["state"] = "running"
+
+    # Shutdown status
+    _DAEMON_STATUS["state"] = "stopping"
+    _write_status()
 
     if insights_conn is not None:
         try:
@@ -346,6 +424,8 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
         except Exception:
             pass
 
+    _DAEMON_STATUS["state"] = "stopped"
+    _write_status()
     logger.info("Daemon shutting down gracefully")
 
 
