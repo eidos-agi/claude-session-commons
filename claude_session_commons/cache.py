@@ -6,6 +6,7 @@ fields are ignored on next read.
 
 Fields independent of cache_key (persist across changes):
     last_seen — timestamp of last TUI view (for cooldown/dedup)
+    bookmark  — human-authored lifecycle signal (from /bookmark skill)
 """
 
 import hashlib
@@ -36,9 +37,19 @@ class SessionCache:
             mtime = 0
         return hashlib.md5(f"{session_file}:{mtime}".encode()).hexdigest()
 
+    # Fields that persist across cache_key changes (human-authored, not AI-derived)
+    _PERSISTENT_FIELDS = frozenset({"bookmark", "last_seen"})
+
     def get(self, session_id: str, cache_key: str, field: str):
-        """Get a cached field. Returns None if stale or missing."""
+        """Get a cached field. Returns None if stale or missing.
+
+        Persistent fields (bookmark, last_seen) survive cache_key invalidation
+        because they are human-authored and should not be discarded when the
+        session JSONL changes.
+        """
         data = self._read(session_id)
+        if field in self._PERSISTENT_FIELDS:
+            return data.get(field)
         if data.get("cache_key") == cache_key:
             return data.get(field)
         return None

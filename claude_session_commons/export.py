@@ -50,4 +50,40 @@ def export_context_md(session: dict, summary: dict | None,
             lines.append(f"- {d}")
         lines.append("")
 
+    # Include bookmark data if present (human-authored lifecycle signals)
+    bookmark = display.get("bookmark") or (session.get("bookmark") if session else None)
+    if bookmark and isinstance(bookmark, dict):
+        state = bookmark.get("lifecycle_state", "unknown")
+        lines += [f"## Session State: {state}", ""]
+
+        bk_context = bookmark.get("context", {})
+        if bk_context.get("summary"):
+            lines += [bk_context["summary"], ""]
+
+        next_actions = bookmark.get("next_actions", [])
+        if next_actions:
+            lines.append("### Next Actions")
+            for a in next_actions:
+                lines.append(f"- {a}")
+            lines.append("")
+
+        blockers = bookmark.get("blockers", [])
+        if blockers:
+            lines.append("### Blockers")
+            for b in blockers:
+                if isinstance(b, dict):
+                    lines.append(f"- {b.get('description', str(b))}")
+                else:
+                    lines.append(f"- {b}")
+            lines.append("")
+
+        confidence = bookmark.get("confidence", {})
+        if confidence and confidence.get("level"):
+            lines.append(f"**Confidence:** {confidence['level']}")
+            risk = confidence.get("risk_areas", [])
+            if risk:
+                for r in risk:
+                    lines.append(f"- Risk: {r}")
+            lines.append("")
+
     return "\n".join(lines)

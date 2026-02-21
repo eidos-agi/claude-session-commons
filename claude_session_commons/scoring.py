@@ -15,7 +15,18 @@ def interruption_score(session: dict) -> float:
     - last_entry_type: what was the session doing when it stopped?
     - recency: how recently was it active?
     - file_size: proxy for invested work
+    - bookmark lifecycle_state: human-authored signal overrides heuristics
     """
+    # If a human-authored bookmark exists, lifecycle_state takes priority
+    bookmark = session.get("bookmark", {})
+    lifecycle = bookmark.get("lifecycle_state") if bookmark else None
+    if lifecycle == "done":
+        return 0  # Fully complete — no urgency
+    elif lifecycle == "blocked":
+        return 70  # Needs attention — external dependency
+    elif lifecycle == "handing-off":
+        return 50  # Someone needs to pick this up
+
     score = 0.0
     now = time.time()
 
@@ -52,5 +63,9 @@ def interruption_score(session: dict) -> float:
         score += 10
     elif size_mb > 1:
         score += 5
+
+    # For paused sessions, ensure a minimum score (intentional stop, low urgency)
+    if lifecycle == "paused":
+        return max(min(score, 100), 20)
 
     return min(score, 100)

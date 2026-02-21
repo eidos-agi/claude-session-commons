@@ -9,10 +9,19 @@ description = "Shared session discovery, caching, and classification for Claude 
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
+    "textual>=0.40",
 ]
 
+[project.scripts]
+claude-session-daemon = "claude_session_commons.daemon:main"
+claude-find = "claude_session_commons.cli_find:main"
+
 [project.optional-dependencies]
+insights = ["sqlite-vec", "fastembed>=0.2.0", "pysqlite3"]
 train = ["pandas", "scikit-learn"]
+
+[tool.setuptools.packages.find]
+include = ["claude_session_commons*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

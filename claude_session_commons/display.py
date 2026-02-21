@@ -91,3 +91,22 @@ def format_duration(secs: float) -> str:
     hours = int(secs) // 3600
     remaining_min = (int(secs) % 3600) // 60
     return f"{hours}h {remaining_min}m" if remaining_min else f"{hours}h"
+
+
+def lifecycle_badge(bookmark: dict | None) -> str:
+    """Return a Rich-styled badge string for a session's lifecycle state.
+
+    Normal states (done, paused) get no badge — they're the healthy norm.
+    Problem states (no bookmark, blocked, abrupt close) get flagged.
+    """
+    if not bookmark:
+        return "[bold red]NO SIGNAL[/]"
+    state = bookmark.get("lifecycle_state", "")
+    badges = {
+        "done": "",           # Normal — human said they're done
+        "paused": "",         # Normal — human said they're pausing
+        "blocked": "[red]BLOCKED[/]",
+        "auto-closed": "[dim]NO SIGNAL[/]",
+        "handing-off": "[cyan]HANDOFF[/]",
+    }
+    return badges.get(state, "")
