@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: claude-session-commons
-Version: 0.1.0
-Summary: Shared session discovery, caching, and classification for Claude Code tools
-Requires-Python: >=3.11
-Requires-Dist: numpy
-Provides-Extra: train
-Requires-Dist: pandas; extra == "train"
-Requires-Dist: scikit-learn; extra == "train"
