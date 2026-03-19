@@ -30,6 +30,9 @@ from claude_session_commons.insights import (
     ChunkResult,
     _serialize_vector,
     _embed_texts,
+    _fts_search,
+    _auto_entity_search,
+    rrf_search,
     EMBEDDING_DIM,
 )
 
@@ -101,10 +104,11 @@ def test_index_session_basic(db, embed_model):
         summarize_subagents=False,
     )
     assert turns >= 4  # fixture has 6 user-assistant pairs
-    assert subagents >= 1  # 1 subagent with enough entries
+    # Subagent threshold is 10; fixture has only 6 progress entries per slug
+    assert subagents == 0
 
     stats = get_stats(db)
-    assert stats["total_chunks"] == turns + subagents
+    assert stats["total_chunks"] == turns
     assert stats["sessions_indexed"] == 1
 
 
@@ -144,7 +148,8 @@ def test_index_session_chunk_types(db, embed_model):
         "SELECT COUNT(*) FROM chunks WHERE chunk_type = 'subagent_summary'"
     ).fetchone()[0]
     assert turn_count >= 4
-    assert sub_count >= 1
+    # Subagent threshold is 10; fixture subagents are below threshold
+    assert sub_count == 0
 
 
 # ── Query tests ───────────────────────────────────────────────
@@ -233,3 +238,112 @@ def test_query_result_metadata(db, embed_model):
     assert isinstance(r.metadata, dict)
     assert r.timestamp
     assert r.distance >= 0
+
+
+# ── FTS5 tests ───────────────────────────────────────────────
+
+def test_fts5_table_created(db):
+    """init_db should create the chunks_fts FTS5 table."""
+    tables = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()
+    table_names = [t[0] for t in tables]
+    assert "chunks_fts" in table_names
+
+
+def test_fts_search_returns_results(db, embed_model):
+    """FTS search should find chunks by keyword."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = _fts_search("database schema", db, limit=5)
+    assert len(results) > 0
+    assert all(isinstance(r, ChunkResult) for r in results)
+
+
+def test_fts_search_empty_query(db):
+    """FTS search with empty/nonsense query should return empty list."""
+    results = _fts_search("", db)
+    assert results == []
+
+
+def test_fts_search_no_match(db, embed_model):
+    """FTS search for nonexistent term should return empty list."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = _fts_search("xyzzyplughtwisty", db)
+    assert results == []
+
+
+# ── RRF tests ─────────────────────────────────────────────────
+
+def test_rrf_search_returns_results(db, embed_model):
+    """RRF search should return combined results."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = rrf_search("database schema", db, model=embed_model, limit=5)
+    assert len(results) > 0
+    assert all(isinstance(r, ChunkResult) for r in results)
+
+
+def test_rrf_search_respects_limit(db, embed_model):
+    """RRF search should respect the limit parameter."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = rrf_search("database", db, model=embed_model, limit=2)
+    assert len(results) <= 2
+
+
+def test_rrf_search_empty_db(db, embed_model):
+    """RRF search on empty database should return empty list."""
+    results = rrf_search("anything", db, model=embed_model)
+    assert results == []
+
+
+def test_rrf_search_distance_consistency(db, embed_model):
+    """RRF results should have distance values where lower = better."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = rrf_search("database schema", db, model=embed_model, limit=5)
+    assert len(results) > 1
+    # Results should be sorted by distance ascending (lower = better)
+    for i in range(len(results) - 1):
+        assert results[i].distance <= results[i + 1].distance
+
+
+def test_rrf_deduplicates_across_retrievers(db, embed_model):
+    """RRF should not return duplicate chunks from different retrievers."""
+    index_session(
+        str(FIXTURE), db, model=embed_model,
+        session_id="test-session-001",
+        project_path="/Users/dev/myproject",
+        summarize_subagents=False,
+    )
+
+    results = rrf_search("database schema", db, model=embed_model, limit=10)
+    ids = [r.id for r in results]
+    assert len(ids) == len(set(ids)), "RRF returned duplicate chunk IDs"

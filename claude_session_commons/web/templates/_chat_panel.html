@@ -1,0 +1,41 @@
+{# Shared chat panel HTML — included by home.html, chat.html, playbooks.html
+   Required context vars: chat_id, welcome_text, placeholder, agent_type (optional) #}
+
+<div class="chat-panel">
+    <h4 style="display: flex; justify-content: space-between; align-items: center;">
+        Chat
+        <span class="chat-history-btn">
+            <a href="#" onclick="toggleHistory(event)" style="font-size: 0.8rem;">History</a>
+            <div class="chat-history-dropdown" id="chat-history-dropdown">
+                <div class="chat-history-empty" id="chat-history-loading">Loading...</div>
+            </div>
+        </span>
+    </h4>
+    <div class="chat-messages" id="chat-messages">
+        <div class="chat-msg welcome">
+            {{ welcome_text }}
+        </div>
+        <div id="sse-target"></div>
+    </div>
+
+    <div class="working-bar" id="working-bar">
+        <span class="working-dot"></span>
+        <span class="working-status" id="working-status">Thinking...</span>
+        <span class="elapsed" id="working-elapsed"></span>
+    </div>
+
+    <div class="chat-input">
+        <form id="chat-form" hx-post="/api/chat/send" hx-swap="none"
+              hx-on::after-request="clearInput(this)"
+              hx-on::before-request="startWorking()">
+            <input type="hidden" name="chat_id" value="{{ chat_id }}">
+            {% if agent_type %}<input type="hidden" name="agent" value="{{ agent_type }}">{% endif %}
+            <fieldset role="group">
+                <input type="text" name="message" id="chat-input"
+                       placeholder="{{ placeholder }}"
+                       autofocus autocomplete="off" required>
+                <button type="submit" id="send-btn">Send</button>
+            </fieldset>
+        </form>
+    </div>
+</div>

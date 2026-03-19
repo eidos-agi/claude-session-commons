@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Session Intelligence</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+    <style>
+        :root { --pico-font-size: 15px; }
+        nav { margin-bottom: 0; }
+
+        .page-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            height: calc(100vh - 80px);
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 1rem;
+        }
+        @media (max-width: 900px) {
+            .page-layout {
+                grid-template-columns: 1fr;
+                height: auto;
+            }
+        }
+
+        /* ── Left panel: Search ──────────────────────── */
+        .search-panel {
+            overflow-y: auto;
+            padding: 1rem 0;
+        }
+        .search-panel h3 { margin-bottom: 0.75rem; }
+
+        .search-form fieldset[role="group"] { margin-bottom: 0.5rem; }
+        .search-form input[type="text"] { margin-bottom: 0; }
+        .search-filters {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+        .search-filters select { margin-bottom: 0; font-size: 0.85rem; padding: 0.3rem 0.5rem; }
+        .search-filters input[type="number"] { margin-bottom: 0; width: 70px; font-size: 0.85rem; padding: 0.3rem 0.5rem; }
+        .search-filters label { font-size: 0.8rem; margin-bottom: 0; }
+
+        .visually-hidden {
+            position: absolute; width: 1px; height: 1px; padding: 0;
+            margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0;
+        }
+
+        /* ── Search results ──────────────────────────── */
+        .search-result {
+            padding: 0.75rem;
+            margin-bottom: 0.6rem;
+            border-radius: 6px;
+            background: var(--pico-card-background-color);
+            border-left: 3px solid #2196f3;
+        }
+        .search-result .meta {
+            font-size: 0.75rem;
+            opacity: 0.7;
+            margin-bottom: 0.4rem;
+        }
+        .search-result .snippet {
+            font-size: 0.8rem;
+            line-height: 1.4;
+            margin-bottom: 0.4rem;
+        }
+        .search-result .snippet mark {
+            background: #ffd54f;
+            color: #1a1a2e;
+            padding: 1px 2px;
+            border-radius: 2px;
+        }
+        .search-result .entities { margin-top: 0.4rem; }
+        .entity-chip {
+            display: inline-block;
+            font-size: 0.65rem;
+            padding: 2px 5px;
+            margin: 1px;
+            border-radius: 3px;
+            background: #2a2a4a;
+            border: 1px solid #444;
+            cursor: pointer;
+            opacity: 0.8;
+        }
+        .entity-chip:hover { opacity: 1; background: #3a3a5a; }
+        .entity-chip.file { border-color: #43a047; }
+        .entity-chip.error { border-color: #e53935; }
+        .entity-chip.branch { border-color: #2196f3; }
+        .search-result .relevance {
+            float: right;
+            font-size: 0.7rem;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .relevance-high { background: #43a047; color: white; }
+        .relevance-med  { background: #ff9800; color: white; }
+        .relevance-low  { background: #757575; color: white; }
+        .search-result .actions {
+            margin-top: 0.4rem;
+            display: flex;
+            gap: 0.3rem;
+        }
+        .action-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.2rem;
+            font-size: 0.65rem;
+            padding: 2px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+            border: 1px solid #555;
+            background: transparent;
+            color: var(--pico-color);
+            opacity: 0.7;
+            text-decoration: none;
+        }
+        .action-btn:hover { opacity: 1; background: rgba(255,255,255,0.05); }
+        .action-btn.github { border-color: #8b949e; }
+        .action-btn.resume { border-color: #43a047; }
+        .action-btn.open-chat { border-color: #2196f3; }
+        .search-result.chat-result { border-left-color: #9c27b0; }
+        .meta a { color: inherit; text-decoration: underline; opacity: 0.9; }
+        .meta a:hover { opacity: 1; }
+
+        .results-count { font-size: 0.8rem; opacity: 0.7; margin-bottom: 0.5rem; }
+        .search-cold-start { font-size: 0.8rem; opacity: 0.7; padding: 0.4rem 0; }
+
+        .empty-state {
+            text-align: center;
+            padding: 2rem 1rem;
+            opacity: 0.6;
+        }
+        .empty-state p { font-size: 0.85rem; margin: 0.25rem 0; }
+        .suggestions { margin-top: 0.75rem; }
+        .suggestions a {
+            display: inline-block;
+            font-size: 0.8rem;
+            padding: 4px 10px;
+            margin: 3px;
+            border-radius: 4px;
+            background: #2a2a4a;
+            border: 1px solid #444;
+            cursor: pointer;
+            text-decoration: none;
+            color: var(--pico-color);
+        }
+        .suggestions a:hover { background: #3a3a5a; }
+
+        #search-spinner { display: none; }
+        #search-spinner.active { display: inline-block; }
+
+        {% include '_chat_css.html' %}
+    </style>
+</head>
+<body>
+    <nav class="container">
+        <ul><li><strong>Session Intelligence</strong></li></ul>
+        <ul>
+            <li><a href="/" aria-current="page">Home</a></li>
+            <li><a href="/dashboard">Dashboard</a></li>
+            <li><a href="/playbooks">Playbooks</a></li>
+            <li><a href="/docs">API Docs</a></li>
+        </ul>
+    </nav>
+
+    <div class="page-layout">
+        <!-- Left: Search -->
+        <div class="search-panel">
+            <h3>Search</h3>
+            <form class="search-form" id="search-form" onsubmit="doSearch(event)">
+                <label for="search-input" class="visually-hidden">Search your session history</label>
+                <fieldset role="group">
+                    <input type="text" id="search-input" name="query"
+                           aria-label="Search your session history"
+                           placeholder="What were we working on with the auth system?"
+                           required>
+                    <button type="submit" id="search-btn">Search</button>
+                </fieldset>
+                <div class="search-filters">
+                    <label>
+                        <select id="search-type" name="chunk_type">
+                            <option value="">All types</option>
+                            <option value="turn">Conversations</option>
+                            <option value="subagent_summary">Agent summaries</option>
+                            <option value="chat">Web chats</option>
+                        </select>
+                    </label>
+                    <label>
+                        Limit:
+                        <input type="number" id="search-limit" value="10" min="1" max="50">
+                    </label>
+                </div>
+            </form>
+
+            <div id="search-cold-start" class="search-cold-start" style="display:none;">Loading search model (first query takes a few seconds)...</div>
+            <div id="search-results-count" class="results-count" style="display:none;"></div>
+            <div id="search-results">
+                <div class="empty-state" id="search-empty">
+                    <p><strong>{{ stats.sessions_indexed }}</strong> sessions indexed, <strong>{{ stats.total_chunks }}</strong> chunks searchable.</p>
+                    <p>Search across your entire Claude Code history.</p>
+                    <div class="suggestions">
+                        <a href="#" onclick="quickSearch('authentication changes')">auth changes</a>
+                        <a href="#" onclick="quickSearch('bug fixes this week')">recent bugs</a>
+                        <a href="#" onclick="quickSearch('database migration')">migrations</a>
+                        <a href="#" onclick="quickSearch('API endpoint')">API endpoints</a>
+                    </div>
+                </div>
+            </div>
+            <div id="search-error" role="alert" aria-live="assertive" style="color: #e53935; display: none;"></div>
+        </div>
+
+        <!-- Right: Chat -->
+        {% include '_chat_panel.html' %}
+    </div>
+
+    <script>
+    var chatId = '{{ chat_id }}';
+
+    // ── Search ──────────────────────────────────────────────
+
+    var searchCount = 0;
+
+    function quickSearch(query) {
+        document.getElementById('search-input').value = query;
+        doSearch(new Event('submit'));
+        return false;
+    }
+
+    function humanizeChunkType(t) {
+        if (t === 'turn') return 'Conversation';
+        if (t === 'subagent_summary') return 'Agent Summary';
+        if (t === 'chat') return 'Web Chat';
+        return t;
+    }
+
+    function humanizeTimestamp(ts) {
+        if (!ts) return '';
+        try {
+            var d = new Date(ts);
+            var now = new Date();
+            var diffMs = now - d;
+            var diffDays = Math.floor(diffMs / 86400000);
+            if (diffDays === 0) return 'Today, ' + d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+            if (diffDays === 1) return 'Yesterday';
+            if (diffDays < 7) return diffDays + 'd ago';
+            return d.toLocaleDateString([], {month: 'short', day: 'numeric'});
+        } catch (e) { return ts; }
+    }
+
+    function relevanceLabel(distance) {
+        if (distance < 0.6) return { text: 'High', cls: 'relevance-high' };
+        if (distance < 0.9) return { text: 'Good', cls: 'relevance-med' };
+        return { text: 'Partial', cls: 'relevance-low' };
+    }
+
+    function escAttr(s) {
+        if (!s) return '';
+        return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    }
+
+    function humanizeError(err) {
+        if (!err) return 'Something unexpected happened. Try again.';
+        var lower = err.toLowerCase();
+        if (lower.includes('sqlite') || lower.includes('thread'))
+            return 'The search database had a temporary issue. Try again in a moment.';
+        if (lower.includes('insights database not available'))
+            return 'The search index hasn\'t been built yet. Make sure the daemon is running.';
+        if (lower.includes('fastembed'))
+            return 'The search model isn\'t installed. Run: pip install fastembed';
+        return 'Search couldn\'t complete: ' + err;
+    }
+
+    async function launchITerm(sessionId, projectDir) {
+        try {
+            var body = new FormData();
+            body.append('session_id', sessionId);
+            body.append('project_dir', projectDir);
+            var res = await fetch('/api/launch-iterm', { method: 'POST', body: body });
+            var data = await res.json();
+            if (data.error) alert('Failed to launch iTerm: ' + data.error);
+        } catch (e) {
+            alert('Failed to launch iTerm: ' + e.message);
+        }
+    }
+
+    async function searchEntity(type, value) {
+        var resultsDiv = document.getElementById('search-results');
+        var countDiv = document.getElementById('search-results-count');
+        var errorDiv = document.getElementById('search-error');
+        errorDiv.style.display = 'none';
+        resultsDiv.innerHTML = '<p style="opacity:0.5;font-size:0.85rem;">Searching by entity...</p>';
+
+        try {
+            var res = await fetch('/api/search/entities?type=' + encodeURIComponent(type) + '&value=' + encodeURIComponent(value) + '&limit=20');
+            var data = await res.json();
+            if (data.error) {
+                errorDiv.textContent = humanizeError(data.error);
+                errorDiv.style.display = 'block';
+                resultsDiv.innerHTML = '';
+                return;
+            }
+            if (!data.results || data.results.length === 0) {
+                resultsDiv.innerHTML = '<p style="opacity:0.5;font-size:0.85rem;">No results for ' + escHtml(type) + ': ' + escHtml(value) + '</p>';
+                countDiv.style.display = 'none';
+                return;
+            }
+            countDiv.textContent = 'Found ' + data.results.length + ' result' + (data.results.length === 1 ? '' : 's');
+            countDiv.style.display = 'block';
+            resultsDiv.innerHTML = data.results.map(function(r, i) {
+                return '<div class="search-result"><div class="meta">#' + (i+1) +
+                    ' \u00b7 ' + escHtml(humanizeChunkType(r.chunk_type)) +
+                    ' \u00b7 ' + escHtml(r.project_path) +
+                    ' \u00b7 ' + escHtml(humanizeTimestamp(r.timestamp)) +
+                    '</div><div class="snippet">' + escHtml((r.content || '').substring(0, 200)) + '</div></div>';
+            }).join('');
+        } catch (e) {
+            errorDiv.textContent = humanizeError(e.message);
+            errorDiv.style.display = 'block';
+            resultsDiv.innerHTML = '';
+        }
+    }
+
+    async function doSearch(e) {
+        e.preventDefault();
+        var query = document.getElementById('search-input').value.trim();
+        if (!query) return;
+
+        var btn = document.getElementById('search-btn');
+        var resultsDiv = document.getElementById('search-results');
+        var errorDiv = document.getElementById('search-error');
+        var countDiv = document.getElementById('search-results-count');
+        var coldDiv = document.getElementById('search-cold-start');
+
+        btn.setAttribute('aria-busy', 'true');
+        btn.textContent = 'Searching...';
+        errorDiv.style.display = 'none';
+        countDiv.style.display = 'none';
+        resultsDiv.innerHTML = '';
+
+        searchCount++;
+        if (searchCount === 1) coldDiv.style.display = 'block';
+
+        try {
+            var body = {
+                query: query,
+                limit: parseInt(document.getElementById('search-limit').value) || 10,
+            };
+            var chunkType = document.getElementById('search-type').value;
+            if (chunkType) body.chunk_type = chunkType;
+
+            var res = await fetch('/api/search', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body),
+            });
+            var data = await res.json();
+
+            if (data.error) {
+                errorDiv.textContent = humanizeError(data.error);
+                errorDiv.style.display = 'block';
+                return;
+            }
+
+            if (!data.results || data.results.length === 0) {
+                resultsDiv.innerHTML = '<p style="opacity:0.5;font-size:0.85rem;">No results found. Try different keywords.</p>';
+                return;
+            }
+
+            countDiv.textContent = 'Found ' + data.results.length + ' result' + (data.results.length === 1 ? '' : 's');
+            countDiv.style.display = 'block';
+
+            resultsDiv.innerHTML = data.results.map(function(r, i) {
+                var rel = relevanceLabel(r.distance);
+                var isChat = r.chunk_type === 'chat';
+                var isSession = r.chunk_type === 'turn' || r.chunk_type === 'subagent_summary';
+
+                var chips = '';
+                if (r.metadata) {
+                    var files = r.metadata.files_touched || [];
+                    var branch = r.metadata.git_branch || '';
+                    if (branch) chips += '<span class="entity-chip branch" onclick="searchEntity(\'git_branch\',\'' + escAttr(branch) + '\')">' + escHtml(branch) + '</span>';
+                    files.slice(0, 3).forEach(function(f) {
+                        var short = f.split('/').slice(-2).join('/');
+                        chips += '<span class="entity-chip file" onclick="searchEntity(\'file_path\',\'' + escAttr(f) + '\')">' + escHtml(short) + '</span>';
+                    });
+                }
+
+                var actions = '';
+                if (r.github_url) {
+                    actions += '<a href="' + escAttr(r.github_url) + '" target="_blank" class="action-btn github">GitHub</a>';
+                }
+                if (isSession) {
+                    actions += '<button class="action-btn resume" onclick="launchITerm(\'' + escAttr(r.session_id) + '\',\'' + escAttr(r.project_path) + '\')">Resume in iTerm</button>';
+                }
+                if (isChat) {
+                    actions += '<a href="/?reload=' + encodeURIComponent(r.session_id) + '" class="action-btn open-chat">Open Chat</a>';
+                }
+
+                var projectDisplay = r.github_url
+                    ? '<a href="' + escAttr(r.github_url) + '" target="_blank">' + escHtml(r.project_path) + '</a>'
+                    : escHtml(r.project_path);
+
+                return '<div class="search-result' + (isChat ? ' chat-result' : '') + '">' +
+                    '<span class="relevance ' + rel.cls + '">' + rel.text + '</span>' +
+                    '<div class="meta">#' + (i+1) + ' \u00b7 ' + escHtml(humanizeChunkType(r.chunk_type)) +
+                    ' \u00b7 ' + projectDisplay +
+                    ' \u00b7 ' + escHtml(humanizeTimestamp(r.timestamp)) + '</div>' +
+                    '<div class="snippet">' + (r.snippet || escHtml((r.content || '').substring(0, 200))) + '</div>' +
+                    (chips ? '<div class="entities">' + chips + '</div>' : '') +
+                    (actions ? '<div class="actions">' + actions + '</div>' : '') +
+                    '</div>';
+            }).join('');
+        } catch (e) {
+            errorDiv.textContent = humanizeError(e.message);
+            errorDiv.style.display = 'block';
+        } finally {
+            btn.removeAttribute('aria-busy');
+            btn.textContent = 'Search';
+            coldDiv.style.display = 'none';
+        }
+    }
+
+    // ── Chat ────────────────────────────────────────────────
+    </script>
+    {% include '_chat_js.html' %}
+</body>
+</html>

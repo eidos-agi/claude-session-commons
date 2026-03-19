@@ -24,9 +24,18 @@ from pathlib import Path
 from .cache import SessionCache
 from .classify import get_label_deep
 from .discovery import find_recent_sessions
-from .git_context import get_git_context
+from .git_context import get_git_context, get_git_anchor
 from .parse import parse_session
 from .summarize import analyze_patterns, summarize_deep, summarize_quick
+
+# Local LLM for fast window summaries (optional — requires claude-resume[local])
+_local_llm_generate = None
+try:
+    from claude_resume.local_llm import generate as _local_llm_generate, is_available as _local_llm_ok
+    if not _local_llm_ok():
+        _local_llm_generate = None
+except ImportError:
+    pass
 
 # Insights (optional — requires pip install -e ".[insights]")
 try:
@@ -43,15 +52,218 @@ PID_FILE = CLAUDE_DIR / "session-daemon.pid"
 STATUS_FILE = CLAUDE_DIR / "daemon.status.json"
 RESUME_CACHE_DIR = CLAUDE_DIR / "resume-summaries"
 TASK_DIR = CLAUDE_DIR / "daemon-tasks"
+INSIGHTS_SKIP_FILE = CLAUDE_DIR / "insights-skip.json"
 
-IDLE_THRESHOLD_SECS = 600       # 10 minutes — don't process active sessions
+IDLE_THRESHOLD_SECS = 300       # 5 minutes — don't process active sessions
 POLL_INTERVAL_SECS = 300        # 5 minutes between scans
 TASK_POLL_SECS = 2              # check for TUI task requests every 2s
 RATE_LIMIT_SECS = 3             # pause between sessions (on top of claude -p time)
 LOOKBACK_HOURS = 720            # 30 days — only process recent sessions
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per log file
 LOG_BACKUP_COUNT = 3
-DAEMON_VERSION = "1.1.0"
+DAEMON_VERSION = "1.2.0"
+INSIGHTS_MAX_FAILURES = 3       # skip session after N consecutive indexing failures
+
+
+# ── LLM Queue ────────────────────────────────────────────────
+# Single-threaded summarization queue. One inference at a time.
+# Callers submit work via llm_queue_submit(), results arrive in cache.
+# Supports any local model (Gemma today, Phi-3 tomorrow).
+
+import queue as _queue_mod
+
+_llm_queue: _queue_mod.Queue = _queue_mod.Queue()
+_llm_thread: threading.Thread | None = None
+_llm_shutdown = threading.Event()
+
+
+def _llm_worker(logger: logging.Logger):
+    """Drain the LLM queue forever. One inference at a time. Exits on poison pill."""
+    while not _llm_shutdown.is_set():
+        try:
+            item = _llm_queue.get(timeout=2)
+        except _queue_mod.Empty:
+            continue
+
+        if item is None:  # poison pill
+            break
+
+        kind = item.get("kind")
+        try:
+            if kind == "window_summary":
+                _llm_do_window_summary(item, logger)
+            elif kind == "window_summaries_batch":
+                _llm_do_window_summaries_batch(item, logger)
+            else:
+                logger.warning("LLM queue: unknown kind %r", kind)
+        except Exception as e:
+            logger.warning("LLM queue error [%s]: %s", kind, e)
+        finally:
+            _llm_queue.task_done()
+
+
+LLM_MAX_INPUT_CHARS = 4000  # ~1K tokens for Gemma 2B — safe under 8K context window
+
+
+def _cap_context(text: str, max_chars: int = LLM_MAX_INPUT_CHARS) -> str:
+    """Cap context to max_chars. For long text, keep first 1K + last 3K
+    so the model sees both the start and end of the time window."""
+    if not text or len(text) <= max_chars:
+        return text
+    head = max_chars // 4       # 1K chars from start
+    tail = max_chars - head     # 3K chars from end
+    return text[:head] + "\n\n[... middle truncated ...]\n\n" + text[-tail:]
+
+
+MAPREDUCE_CHUNK_CHARS = 1300  # ~325 tokens per chunk — fast inference per pass
+MAPREDUCE_THRESHOLD = 2500    # contexts larger than this get map-reduced
+
+
+def _llm_infer(prompt: str, max_tokens: int, logger: logging.Logger) -> str:
+    """Run a single LLM inference. Gemma first, haiku fallback. Returns raw output."""
+    import subprocess
+
+    output = ""
+    if _local_llm_generate is not None:
+        try:
+            output = _local_llm_generate(prompt, max_tokens=max_tokens)
+        except Exception as e:
+            logger.debug("Local LLM failed: %s", e)
+
+    if not output or len(output.strip()) < 3:
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--model", "haiku", prompt],
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "cli"},
+            )
+            output = result.stdout.strip()
+        except Exception as e:
+            logger.debug("Haiku fallback failed: %s", e)
+            output = ""
+
+    return output.strip()
+
+
+def _llm_do_window_summary(item: dict, logger: logging.Logger):
+    """Generate a single window summary (5m, 30m, or 2h).
+    Uses map-reduce for large contexts: chunk → summarize each → summarize summaries."""
+
+    key = item["key"]           # "5m", "30m", "2h"
+    raw_context = item["context"] or ""
+    sid = item["session_id"]
+    file_path = item["file"]
+    caches = item["caches"]
+    callback = item.get("callback")  # optional notify function
+
+    label_map = {"5m": "LAST 5 MINUTES", "30m": "LAST 30 MINUTES", "2h": "LAST 2 HOURS"}
+    label = label_map.get(key, key)
+
+    if not raw_context.strip():
+        summary = "no activity"
+    elif len(raw_context) > MAPREDUCE_THRESHOLD:
+        # ── Map-Reduce: chunk → summarize each → reduce ──
+        chunks = []
+        for i in range(0, len(raw_context), MAPREDUCE_CHUNK_CHARS):
+            chunks.append(raw_context[i:i + MAPREDUCE_CHUNK_CHARS])
+
+        chunk_summaries = []
+        for ci, chunk in enumerate(chunks):
+            prompt = f"""Summarize this chunk ({ci+1}/{len(chunks)}) of a Claude Code session's {label}.
+ONE sentence, max 15 words. Focus on the WHAT — name the feature, bug, or file.
+
+{chunk}
+"""
+            out = _llm_infer(prompt, max_tokens=40, logger=logger)
+            if out:
+                chunk_summaries.append(out.split("\n")[0].strip())
+
+        if chunk_summaries:
+            # Reduce: merge chunk summaries into one
+            combined = "\n".join(f"- {s}" for s in chunk_summaries)
+            reduce_prompt = f"""These are summaries of consecutive chunks from a Claude Code session's {label}.
+Merge into ONE sentence (max 15 words). Focus on the main activity.
+
+{combined}
+"""
+            summary = _llm_infer(reduce_prompt, max_tokens=40, logger=logger)
+            summary = summary.split("\n")[0].strip() if summary else "summary failed"
+        else:
+            summary = "summary failed"
+
+        logger.info("LLM MAP-REDUCE: %s/%s -> %d chunks -> %s", sid[:8], key, len(chunks), summary[:40])
+    else:
+        # ── Single pass: small context ──
+        context = _cap_context(raw_context)
+        prompt = f"""Summarize what was happening in a Claude Code session during the {label}.
+Write ONE sentence (max 15 words). Focus on the WHAT — name the feature, bug, or file.
+If no activity, say "no activity". Return ONLY the summary, no prefix.
+
+--- {label} ---
+{context}
+"""
+        summary = _llm_infer(prompt, max_tokens=60, logger=logger)
+        summary = summary.split("\n")[0].strip() if summary else "summary failed"
+
+    # Clean prefix echoes
+    for prefix in ("5m:", "30m:", "2h:"):
+        if summary.lower().startswith(prefix):
+            summary = summary[len(prefix):].strip()
+    if not summary:
+        summary = "no activity"
+
+    # Merge into cache
+    for cache in caches:
+        ck = cache.cache_key(file_path)
+        existing = cache.get(sid, ck, "window_summaries")
+        if not existing or not isinstance(existing, dict):
+            existing = {}
+        existing[key] = summary
+        cache.set(sid, ck, "window_summaries", existing)
+
+    logger.info("LLM OK: %s/%s -> %s", sid[:8], key, summary[:40])
+    if callback:
+        try:
+            callback(sid, key, summary)
+        except Exception:
+            pass
+
+
+def _llm_do_window_summaries_batch(item: dict, logger: logging.Logger):
+    """Generate all 3 window summaries sequentially for one session."""
+    contexts = item["contexts"]  # {"5m": "...", "30m": "...", "2h": "..."}
+    for key in ("5m", "30m", "2h"):
+        ctx = contexts.get(key, "")
+        sub = {**item, "kind": "window_summary", "key": key, "context": ctx}
+        _llm_do_window_summary(sub, logger)
+
+
+def llm_queue_submit(item: dict):
+    """Submit work to the LLM queue. Non-blocking."""
+    _llm_queue.put(item)
+
+
+def llm_queue_depth() -> int:
+    return _llm_queue.qsize()
+
+
+def _start_llm_worker(logger: logging.Logger):
+    """Start the LLM worker thread (idempotent)."""
+    global _llm_thread
+    if _llm_thread is not None and _llm_thread.is_alive():
+        return
+    _llm_shutdown.clear()
+    _llm_thread = threading.Thread(target=_llm_worker, args=(logger,), daemon=True, name="llm-worker")
+    _llm_thread.start()
+    logger.info("LLM worker started (model=%s)", "gemma-2b" if _local_llm_generate else "haiku-fallback")
+
+
+def _stop_llm_worker():
+    """Signal the worker to stop and wait."""
+    _llm_shutdown.set()
+    _llm_queue.put(None)  # poison pill
+    if _llm_thread is not None:
+        _llm_thread.join(timeout=10)
 
 
 # ── Logging ──────────────────────────────────────────────────
@@ -134,6 +346,50 @@ def _write_status(status: dict | None = None):
         pass  # Best-effort — don't crash the daemon over status writes
 
 
+# ── Insights skip list ───────────────────────────────────────
+
+# Track consecutive failures per session: {session_id: count}
+_insights_fail_counts: dict[str, int] = {}
+_insights_skip_set: set[str] = set()
+
+
+def _load_skip_list():
+    """Load persistent skip list of sessions that consistently fail indexing."""
+    global _insights_skip_set
+    if INSIGHTS_SKIP_FILE.exists():
+        try:
+            data = json.loads(INSIGHTS_SKIP_FILE.read_text())
+            _insights_skip_set = set(data.get("skip", []))
+        except Exception:
+            _insights_skip_set = set()
+
+
+def _save_skip_list():
+    """Persist skip list to disk."""
+    try:
+        INSIGHTS_SKIP_FILE.write_text(json.dumps(
+            {"skip": sorted(_insights_skip_set)}, indent=2,
+        ))
+    except OSError:
+        pass
+
+
+def _record_insights_failure(session_id: str, logger: logging.Logger):
+    """Record an indexing failure. After INSIGHTS_MAX_FAILURES, add to skip list."""
+    _insights_fail_counts[session_id] = _insights_fail_counts.get(session_id, 0) + 1
+    if _insights_fail_counts[session_id] >= INSIGHTS_MAX_FAILURES:
+        if session_id not in _insights_skip_set:
+            _insights_skip_set.add(session_id)
+            _save_skip_list()
+            logger.info("INSIGHTS SKIP: %s... added to skip list after %d failures",
+                        session_id[:8], INSIGHTS_MAX_FAILURES)
+
+
+def _should_skip_insights(session_id: str) -> bool:
+    """Check if a session is in the skip list."""
+    return session_id in _insights_skip_set
+
+
 # ── Session filtering ────────────────────────────────────────
 
 def _find_idle_uncached(
@@ -143,7 +399,7 @@ def _find_idle_uncached(
     """Find sessions that are idle (10min+) and missing from any cache."""
     now = time.time()
     cutoff = now - IDLE_THRESHOLD_SECS
-    all_sessions = find_recent_sessions(LOOKBACK_HOURS)
+    all_sessions = find_recent_sessions(LOOKBACK_HOURS, max_sessions=0)
 
     candidates = []
     for s in all_sessions:
@@ -161,6 +417,315 @@ def _find_idle_uncached(
             candidates.append(s)
 
     return candidates
+
+
+def _find_insights_backlog(
+    caches: list[SessionCache],
+    insights_conn,
+    logger: logging.Logger,
+    batch_size: int = 50,
+) -> list[dict]:
+    """Find sessions that are cached but NOT in the insights DB.
+
+    These were processed for quick summaries but never made it into
+    the semantic search index (insights). Returns up to batch_size.
+    """
+    if insights_conn is None:
+        return []
+
+    from .insights import is_indexed
+
+    now = time.time()
+    cutoff = now - IDLE_THRESHOLD_SECS
+    all_sessions = find_recent_sessions(LOOKBACK_HOURS, max_sessions=0)
+
+    backlog = []
+    for s in all_sessions:
+        if s["mtime"] > cutoff:
+            continue
+
+        # Must already be cached (summary done)
+        any_cached = False
+        for cache in caches:
+            ck = cache.cache_key(s["file"])
+            if cache.get(s["session_id"], ck, "summary"):
+                any_cached = True
+                break
+
+        if not any_cached:
+            continue  # not cached yet — let _find_idle_uncached handle it
+
+        # Check if insights indexed (and not on skip list)
+        if not is_indexed(insights_conn, s["session_id"]) and not _should_skip_insights(s["session_id"]):
+            backlog.append(s)
+            if len(backlog) >= batch_size:
+                break
+
+    return backlog
+
+
+# ── Window summaries + scoring ───────────────────────────────
+
+def _compute_window_summaries(
+    session: dict,
+    caches: list[SessionCache],
+    logger: logging.Logger,
+) -> bool:
+    """Generate ML time-window summaries (5m/30m/2h) for a session.
+    Submits to the LLM queue — non-blocking, one window at a time."""
+    from datetime import datetime
+
+    sid = session["session_id"]
+    file_path = session["file"]
+
+    # Check if already cached
+    for cache in caches:
+        ck = cache.cache_key(file_path)
+        existing = cache.get(sid, ck, "window_summaries")
+        if existing and isinstance(existing, dict) and "5m" in existing:
+            return True  # already done
+
+    # Extract conversation context per window
+    WINDOWS = {"5m": 5, "30m": 30, "2h": 120}
+    raw: dict[str, list[str]] = {k: [] for k in WINDOWS}
+
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read_from = max(0, size - 524288)
+            f.seek(read_from)
+            chunk = f.read().decode("utf-8", errors="replace")
+            lines = chunk.strip().split("\n")
+    except OSError:
+        return False
+
+    last_ts = None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+            ts = entry.get("timestamp")
+            if ts:
+                last_ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                break
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if last_ts is None:
+        return False
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = entry.get("timestamp")
+        if not ts:
+            continue
+        try:
+            entry_ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        age_min = (last_ts - entry_ts) / 60
+        entry_type = entry.get("type", "")
+
+        for key, minutes in WINDOWS.items():
+            if age_min > minutes:
+                continue
+            if entry_type == "user":
+                msg = entry.get("message", {})
+                content = msg.get("content", "") if isinstance(msg, dict) else ""
+                text = ""
+                if isinstance(content, str) and len(content) > 5:
+                    text = content[:300]
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "")[:300]
+                            break
+                if text:
+                    raw[key].append(f"USER: {text}")
+            elif entry_type == "assistant":
+                msg = entry.get("message", {})
+                content = msg.get("content", "") if isinstance(msg, dict) else ""
+                text = ""
+                if isinstance(content, str):
+                    text = content[:300]
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text = part.get("text", "")[:300]
+                            break
+                if text:
+                    raw[key].append(f"ASSISTANT: {text}")
+            elif entry_type == "tool_use":
+                name = entry.get("tool_name", entry.get("name", "?"))
+                raw[key].append(f"TOOL: {name}")
+
+    # Build prompt
+    contexts = {}
+    for key in WINDOWS:
+        entries = raw[key][-30:]
+        text = "\n".join(entries)
+        contexts[key] = text[-3000:] if len(text) > 3000 else text
+
+    if not any(contexts.values()):
+        summaries = {"5m": "no activity", "30m": "no activity", "2h": "no activity"}
+        for cache in caches:
+            ck = cache.cache_key(file_path)
+            cache.set(sid, ck, "window_summaries", summaries)
+        return True
+
+    # Submit to the LLM queue — processes one window at a time, no blocking
+    llm_queue_submit({
+        "kind": "window_summaries_batch",
+        "session_id": sid,
+        "file": file_path,
+        "contexts": contexts,
+        "caches": caches,
+    })
+
+    logger.info("WINDOWS QUEUED: %s... (queue depth: %d)", sid[:8], llm_queue_depth())
+    return True
+
+
+def _compute_active_time(
+    session: dict,
+    caches: list[SessionCache],
+    gap_threshold: float = 120.0,
+) -> dict:
+    """Compute active time by summing inter-entry gaps < threshold (default 120s).
+
+    Returns {"active_seconds": int, "total_seconds": int, "focus_pct": float}
+    Cached as "active_time" key.
+    """
+    from datetime import datetime
+
+    sid = session["session_id"]
+    cache = caches[0]
+    ck = cache.cache_key(session["file"])
+
+    existing = cache.get(sid, ck, "active_time")
+    if existing and isinstance(existing, dict):
+        return existing
+
+    try:
+        with open(session["file"], "rb") as f:
+            data = f.read().decode("utf-8", errors="replace")
+            lines = data.strip().split("\n")
+    except OSError:
+        return {"active_seconds": 0, "total_seconds": 0, "focus_pct": 0.0}
+
+    timestamps = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+            ts = entry.get("timestamp")
+            if ts:
+                timestamps.append(
+                    datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                )
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if len(timestamps) < 2:
+        result = {"active_seconds": 0, "total_seconds": 0, "focus_pct": 0.0}
+        for c in caches:
+            c.set(sid, c.cache_key(session["file"]), "active_time", result)
+        return result
+
+    timestamps.sort()
+    total = timestamps[-1] - timestamps[0]
+    active = sum(
+        timestamps[i + 1] - timestamps[i]
+        for i in range(len(timestamps) - 1)
+        if (timestamps[i + 1] - timestamps[i]) <= gap_threshold
+    )
+
+    focus_pct = round((active / total * 100) if total > 0 else 0, 1)
+    result = {
+        "active_seconds": round(active),
+        "total_seconds": round(total),
+        "focus_pct": focus_pct,
+    }
+
+    for c in caches:
+        c.set(sid, c.cache_key(session["file"]), "active_time", result)
+    return result
+
+
+def _compute_resumability_score(
+    session: dict,
+    caches: list[SessionCache],
+) -> float:
+    """Compute and cache resumability score (0-100)."""
+    import math
+
+    sid = session["session_id"]
+    cache = caches[0]  # primary cache
+    ck = cache.cache_key(session["file"])
+
+    # Check existing
+    existing = cache.get(sid, ck, "resumability_score")
+    if existing is not None:
+        return existing
+
+    # Bookmark overrides
+    bookmark = cache.get(sid, ck, "bookmark")
+    lifecycle = None
+    if bookmark and isinstance(bookmark, dict):
+        lifecycle = bookmark.get("lifecycle_state")
+    if lifecycle == "done":
+        for c in caches:
+            c.set(sid, c.cache_key(session["file"]), "resumability_score", 5.0)
+        return 5.0
+
+    # Engagement (35)
+    stats = cache.get(sid, ck, "stats")
+    engagement = 0.0
+    if stats and isinstance(stats, dict):
+        size = stats.get("file_size", session.get("size", 0))
+        if size > 0:
+            engagement += min(35, 5 * math.log10(max(size, 1000) / 1000) + 5)
+        if stats.get("user_messages", 0) > 20:
+            engagement += 5
+        if stats.get("tool_uses", 0) > 50:
+            engagement += 5
+    else:
+        size = session.get("size", 0)
+        if size > 0:
+            engagement += min(35, 5 * math.log10(max(size, 1000) / 1000) + 5)
+    engagement = min(engagement, 35)
+
+    # Recency (30) — 4hr half-life
+    age_hours = (time.time() - session["mtime"]) / 3600
+    recency = 30.0 * math.exp(-0.693 * age_hours / 4)
+
+    # Unfinished (25)
+    unfinished_map = {"user": 25, "progress": 22, "tool_result": 20, "assistant": 10, "summary": 5}
+    unfinished = unfinished_map.get(session.get("last_entry_type", ""), 8)
+    summary = cache.get(sid, ck, "summary")
+    if summary and isinstance(summary, dict):
+        state = summary.get("state", "")
+        if state and any(w in state.lower() for w in ("done", "completed", "finished")):
+            unfinished = max(unfinished - 10, 0)
+
+    # Classification (10)
+    classification = 5.0
+    if stats and isinstance(stats, dict):
+        cls = stats.get("classification", "pending")
+        classification = 10 if cls == "interactive" else (2 if cls == "automated" else 5)
+
+    score = min(round(engagement + recency + unfinished + classification, 1), 100)
+
+    if lifecycle == "blocked":
+        score = max(score, 60)
+    elif lifecycle == "paused":
+        score = max(score, 40)
+
+    for c in caches:
+        c.set(sid, c.cache_key(session["file"]), "resumability_score", score)
+    return score
 
 
 # ── Analysis pipeline ────────────────────────────────────────
@@ -193,19 +758,40 @@ def _analyze_session(
             get_label_deep(session["file"], cache)
 
         # Insights indexing (optional — embed chunks for semantic search)
-        if insights_conn is not None:
+        if insights_conn is not None and not _should_skip_insights(sid):
             try:
+                git_anchor = get_git_anchor(project_dir)
                 turns, subagents = index_session(
                     str(session["file"]), insights_conn,
                     model=insights_model,
                     session_id=sid,
                     project_path=project_dir,
+                    git_anchor=git_anchor if git_anchor.get("branch") else None,
                 )
                 if turns or subagents:
                     logger.info("INSIGHTS: %s... -> %d turns, %d subagents",
                                 sid[:8], turns, subagents)
             except Exception as ie:
                 logger.warning("INSIGHTS FAIL: %s... -> %s", sid[:8], ie)
+                _record_insights_failure(sid, logger)
+
+        # Window summaries (ML — local Gemma 2B or haiku fallback)
+        try:
+            _compute_window_summaries(session, caches, logger)
+        except Exception as we:
+            logger.debug("Window summaries skipped for %s: %s", sid[:8], we)
+
+        # Resumability score
+        try:
+            _compute_resumability_score(session, caches)
+        except Exception as se:
+            logger.debug("Score skipped for %s: %s", sid[:8], se)
+
+        # Active time / focus metric
+        try:
+            _compute_active_time(session, caches)
+        except Exception as ae:
+            logger.debug("Active time skipped for %s: %s", sid[:8], ae)
 
         title = summary.get("title", "?")
         logger.info("OK: %s... -> %s", sid[:8], title)
@@ -213,6 +799,46 @@ def _analyze_session(
 
     except Exception as e:
         logger.warning("FAIL: %s... -> %s", sid[:8], e)
+        return False
+
+
+def _index_session_only(
+    session: dict,
+    logger: logging.Logger,
+    insights_conn=None,
+    insights_model=None,
+) -> bool:
+    """Index a session into insights DB only (skip summary/classify).
+
+    Used for backfilling sessions that are already cached but missing
+    from the semantic search index.
+    """
+    if insights_conn is None:
+        return False
+
+    sid = session["session_id"]
+    project_dir = session["project_dir"]
+
+    if _should_skip_insights(sid):
+        return False
+
+    try:
+        git_anchor = get_git_anchor(project_dir)
+        turns, subagents = index_session(
+            str(session["file"]), insights_conn,
+            model=insights_model,
+            session_id=sid,
+            project_path=project_dir,
+            git_anchor=git_anchor if git_anchor.get("branch") else None,
+        )
+        if turns or subagents:
+            logger.info("INSIGHTS BACKFILL: %s... -> %d turns, %d subagents",
+                        sid[:8], turns, subagents)
+            return True
+        return False
+    except Exception as ie:
+        logger.warning("INSIGHTS BACKFILL FAIL: %s... -> %s", sid[:8], ie)
+        _record_insights_failure(sid, logger)
         return False
 
 
@@ -283,6 +909,30 @@ def _process_task_files(
                     cache.set(sid, ck, "patterns", patterns)
                 logger.info("TASK OK [%s]: %s...", kind, sid[:8])
 
+            elif kind == "window_summaries":
+                _compute_window_summaries(
+                    {"session_id": sid, "file": file_path, "project_dir": project_dir},
+                    caches, logger,
+                )
+                logger.info("TASK OK [%s]: %s...", kind, sid[:8])
+
+            elif kind == "active_time":
+                _compute_active_time(
+                    {"session_id": sid, "file": file_path, "project_dir": project_dir},
+                    caches,
+                )
+                logger.info("TASK OK [%s]: %s...", kind, sid[:8])
+
+            elif kind == "score":
+                session_dict = {
+                    "session_id": sid, "file": file_path,
+                    "project_dir": project_dir,
+                    "mtime": file_path.stat().st_mtime if file_path.exists() else 0,
+                    "size": file_path.stat().st_size if file_path.exists() else 0,
+                }
+                _compute_resumability_score(session_dict, caches)
+                logger.info("TASK OK [%s]: %s...", kind, sid[:8])
+
             count += 1
 
         except Exception as e:
@@ -314,25 +964,36 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
     # Initialize insights (optional — graceful if deps missing)
     insights_conn = None
     insights_model = None
+    _insights_ok = False  # Flag: deps available, use per-operation connections
     if HAS_INSIGHTS:
         try:
             insights_conn = get_db()
             init_db(insights_conn)
+            insights_conn.close()  # Don't hold a persistent connection
+            insights_conn = None
             from fastembed import TextEmbedding
             insights_model = TextEmbedding("BAAI/bge-small-en-v1.5")
+            _load_skip_list()
+            if _insights_skip_set:
+                logger.info("Insights skip list: %d sessions", len(_insights_skip_set))
             logger.info("Insights enabled (sqlite-vec + fastembed)")
             _DAEMON_STATUS["insights_enabled"] = True
+            _insights_ok = True
         except Exception as e:
             logger.warning("Insights disabled: %s", e)
             insights_conn = None
             insights_model = None
 
+    # Start LLM worker thread (single-threaded queue, no locks)
+    _start_llm_worker(logger)
+
     _DAEMON_STATUS["state"] = "running"
     _write_status()
 
     logger.info(
-        "Daemon started (pid=%d, poll=%ds, idle=%ds)",
+        "Daemon started (pid=%d, poll=%ds, idle=%ds, llm=%s)",
         os.getpid(), POLL_INTERVAL_SECS, IDLE_THRESHOLD_SECS,
+        "gemma-2b" if _local_llm_generate else "haiku",
     )
 
     while not shutdown.is_set():
@@ -364,11 +1025,27 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
                     tasks_done = _process_task_files(caches, shutdown, logger)
                     _DAEMON_STATUS["tasks_processed"] += tasks_done
 
+                    # Open a fresh DB connection per session to avoid
+                    # holding write locks between operations
+                    ic = None
+                    if _insights_ok:
+                        try:
+                            ic = get_db()
+                        except Exception:
+                            pass
+
                     success = _analyze_session(
                         s, caches, logger,
-                        insights_conn=insights_conn,
+                        insights_conn=ic,
                         insights_model=insights_model,
                     )
+
+                    if ic is not None:
+                        try:
+                            ic.close()
+                        except Exception:
+                            pass
+
                     if success:
                         ok += 1
                         _DAEMON_STATUS["sessions_processed"] += 1
@@ -386,14 +1063,84 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
 
                 logger.info("Batch complete: %d ok, %d failed", ok, fail)
 
-            # Update insights chunk count periodically
-            if insights_conn is not None:
+            # Priority 3: Backfill insights for cached-but-unindexed sessions
+            if _insights_ok and not shutdown.is_set():
+                ic = None
                 try:
+                    ic = get_db()
+                    backlog = _find_insights_backlog(
+                        caches, ic, logger, batch_size=50,
+                    )
+                    ic.close()
+                    ic = None
+                except Exception:
+                    if ic:
+                        ic.close()
+                    backlog = []
+
+                if backlog:
+                    logger.info("Insights backlog: %d sessions to index", len(backlog))
+                    for s in backlog:
+                        if shutdown.is_set():
+                            break
+                        tasks_done = _process_task_files(caches, shutdown, logger)
+                        _DAEMON_STATUS["tasks_processed"] += tasks_done
+
+                        ic = None
+                        try:
+                            ic = get_db()
+                        except Exception:
+                            pass
+                        _index_session_only(
+                            s, logger,
+                            insights_conn=ic,
+                            insights_model=insights_model,
+                        )
+                        if ic is not None:
+                            try:
+                                ic.close()
+                            except Exception:
+                                pass
+                        if not shutdown.is_set():
+                            time.sleep(RATE_LIMIT_SECS)
+
+            # Update insights chunk count periodically
+            if _insights_ok:
+                try:
+                    ic = get_db()
                     from .insights import get_stats
-                    _DAEMON_STATUS["insights_chunks"] = get_stats(insights_conn)["total_chunks"]
+                    _DAEMON_STATUS["insights_chunks"] = get_stats(ic)["total_chunks"]
+                    ic.close()
                 except Exception:
                     pass
 
+            # Priority 4: Scan for idle sessions missing window summaries
+            # This is the backup plan — catches anything hooks missed
+            if not shutdown.is_set():
+                now = time.time()
+                all_sessions = find_recent_sessions(LOOKBACK_HOURS, max_sessions=0)
+                queued = 0
+                for s in all_sessions:
+                    if s["mtime"] > now - IDLE_THRESHOLD_SECS:
+                        continue  # still active
+                    sid = s["session_id"]
+                    any_cached = False
+                    for cache in caches:
+                        ck = cache.cache_key(s["file"])
+                        ws = cache.get(sid, ck, "window_summaries")
+                        if ws and isinstance(ws, dict) and "5m" in ws:
+                            any_cached = True
+                            break
+                    if not any_cached:
+                        _compute_window_summaries(s, caches, logger)
+                        queued += 1
+                    if queued >= 10 or shutdown.is_set():
+                        break  # cap per cycle — don't flood the queue
+                if queued:
+                    logger.info("Backfill: queued %d sessions for window summaries (queue: %d)",
+                                queued, llm_queue_depth())
+
+            _DAEMON_STATUS["llm_queue_depth"] = llm_queue_depth()
             _DAEMON_STATUS["state"] = "idle"
             _write_status()
 
@@ -418,11 +1165,9 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
     _DAEMON_STATUS["state"] = "stopping"
     _write_status()
 
-    if insights_conn is not None:
-        try:
-            insights_conn.close()
-        except Exception:
-            pass
+    # Drain LLM queue and stop worker
+    _stop_llm_worker()
+    logger.info("LLM worker stopped (queue drained)")
 
     _DAEMON_STATUS["state"] = "stopped"
     _write_status()

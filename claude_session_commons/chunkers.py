@@ -9,7 +9,6 @@ See planning/SPEC.md sections 2.1-2.2 for algorithm details.
 
 import dataclasses
 import json
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -190,12 +189,14 @@ def chunk_turns(session_path: str | Path) -> list[TurnChunk]:
         if not assistant_text and not tool_descs:
             continue
 
-        # Build embeddable content
+        # Build embeddable content — focus on conversation, not tool noise
         parts = [f"USER: {user_text}"]
         if assistant_text:
             parts.append(f"\nASSISTANT: {assistant_text}")
-        if tool_descs:
-            parts.append(f"\nTOOLS: {', '.join(tool_descs)}")
+        # Only include tool descriptions if they're concise (not bulk file contents)
+        short_descs = [d for d in tool_descs if len(d) < 120]
+        if short_descs:
+            parts.append(f"\nTOOLS: {', '.join(short_descs)}")
 
         content = "\n".join(parts)
         if len(content) > MAX_CONTENT_CHARS:
@@ -237,42 +238,34 @@ def chunk_turns(session_path: str | Path) -> list[TurnChunk]:
 
 # ── Subagent Chunker ──────────────────────────────────────────
 
-MIN_PROGRESS_ENTRIES = 5
+MIN_PROGRESS_ENTRIES = 10
 MAX_SUMMARY_INPUT_CHARS = 4000
 
 
-def _summarize_subagent(initial_prompt: str, work_text: str) -> str:
-    """Summarize a subagent's work via claude -p haiku.
+def _summarize_subagent_deterministic(initial_prompt: str, work_parts: list[str]) -> str:
+    """Build a deterministic summary from subagent progress messages.
 
-    Returns the summary string, or a fallback if the call fails.
+    Takes initial prompt + work messages and produces a focused summary
+    without any LLM calls. Captures task intent + first/last work items.
     """
-    prompt = f"""Summarize this AI agent's work in 2-3 sentences. Focus on:
-what was researched/built, key findings, and outcome.
+    lines = [f"Task: {initial_prompt[:300]}"]
 
-Initial task: {initial_prompt[:500]}
+    if work_parts:
+        # First 3 messages (early work)
+        early = work_parts[:3]
+        # Last 3 messages (final work) — avoid overlap with early
+        late = work_parts[-3:] if len(work_parts) > 6 else work_parts[3:]
 
-Work performed:
-{work_text[:MAX_SUMMARY_INPUT_CHARS]}"""
+        if early:
+            lines.append("\nEarly work:")
+            for msg in early:
+                lines.append(f"- {msg[:200]}")
+        if late:
+            lines.append("\nFinal work:")
+            for msg in late:
+                lines.append(f"- {msg[:200]}")
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--no-session-persistence",
-             "--output-format", "json", "--model", "claude-haiku-4-5-20251001"],
-            capture_output=True, text=True, timeout=30,
-            stdin=subprocess.DEVNULL,
-        )
-        output = result.stdout.strip()
-        parsed = json.loads(output)
-        # Extract text from structured output
-        if isinstance(parsed, dict):
-            if "result" in parsed:
-                return str(parsed["result"]).strip()
-            if "text" in parsed:
-                return str(parsed["text"]).strip()
-        return output[:500]
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
-        # Fallback: use the initial prompt as a minimal summary
-        return f"Agent task: {initial_prompt[:200]}"
+    return "\n".join(lines)
 
 
 def chunk_subagents(session_path: str | Path, summarize: bool = True) -> list[SubagentChunk]:
@@ -280,13 +273,13 @@ def chunk_subagents(session_path: str | Path, summarize: bool = True) -> list[Su
 
     Algorithm:
     1. Group all type=progress entries by slug
-    2. For each slug group with > 5 entries (skip trivial agents):
+    2. For each slug group with >= MIN_PROGRESS_ENTRIES (skip trivial agents):
        a. Extract initial prompt from first entry
        b. Collect text from subsequent entries
-       c. Summarize via claude -p haiku (if summarize=True)
+       c. Build deterministic summary from task + work messages
     3. Return SubagentChunk list
 
-    Set summarize=False for testing (skips LLM calls, uses raw text).
+    The summarize parameter is kept for backward compatibility but ignored.
     """
     session_path = Path(session_path)
     progress_by_slug: dict[str, list[dict]] = {}
@@ -348,15 +341,8 @@ def chunk_subagents(session_path: str | Path, summarize: bool = True) -> list[Su
                             elif block.get("type") == "tool_use":
                                 tools_used.add(block.get("name", ""))
 
-        work_text = "\n".join(work_parts)
-
-        # Summarize or use raw text
-        if summarize and work_text:
-            content = _summarize_subagent(initial_prompt, work_text)
-        elif work_text:
-            content = f"Agent task: {initial_prompt[:200]}\n\nWork: {work_text[:1800]}"
-        else:
-            content = f"Agent task: {initial_prompt[:500]}"
+        # Deterministic summary from task + work messages
+        content = _summarize_subagent_deterministic(initial_prompt, work_parts)
 
         if len(content) > MAX_CONTENT_CHARS:
             content = content[:MAX_CONTENT_CHARS - 14] + "\n[...truncated]"

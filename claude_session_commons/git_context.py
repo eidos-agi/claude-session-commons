@@ -55,6 +55,72 @@ def get_git_context(project_dir: str) -> dict:
     return result
 
 
+def get_git_anchor(project_dir: str) -> dict:
+    """Extract structured git anchor data for entity indexing.
+
+    Returns dict with:
+        branch: str — current branch name
+        commit_hashes: list[str] — last 5 short hashes
+        commit_messages: list[str] — last 5 oneline messages
+        files_changed: list[str] — files from recent commits (deduplicated)
+    """
+    result = {
+        "branch": "",
+        "commit_hashes": [],
+        "commit_messages": [],
+        "files_changed": [],
+    }
+
+    if not os.path.isdir(project_dir):
+        return result
+
+    try:
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, cwd=project_dir, timeout=5,
+        )
+        if check.returncode != 0:
+            return result
+
+        # Current branch
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, cwd=project_dir, timeout=5,
+        )
+        if branch.returncode == 0:
+            result["branch"] = branch.stdout.strip()
+
+        # Last 5 commits (hash + message)
+        log = subprocess.run(
+            ["git", "log", "--oneline", "--no-color", "-5"],
+            capture_output=True, text=True, cwd=project_dir, timeout=5,
+        )
+        if log.returncode == 0 and log.stdout.strip():
+            for line in log.stdout.strip().splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    result["commit_hashes"].append(parts[0])
+                    result["commit_messages"].append(parts[1])
+
+        # Files changed in recent commits
+        diff_files = subprocess.run(
+            ["git", "log", "--name-only", "--pretty=format:", "-5"],
+            capture_output=True, text=True, cwd=project_dir, timeout=5,
+        )
+        if diff_files.returncode == 0 and diff_files.stdout.strip():
+            seen = set()
+            for line in diff_files.stdout.strip().splitlines():
+                f = line.strip()
+                if f and f not in seen:
+                    seen.add(f)
+                    result["files_changed"].append(f)
+
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+
+    return result
+
+
 def has_uncommitted_changes(project_dir: str) -> bool:
     """Quick check for uncommitted git changes."""
     try:

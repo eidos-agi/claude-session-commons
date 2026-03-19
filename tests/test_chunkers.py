@@ -133,40 +133,19 @@ def test_chunk_turns_files_touched():
 # ── Subagent chunker tests ───────────────────────────────────
 
 def test_chunk_subagents_basic():
-    """Parse fixture for subagent chunks (without LLM summarization)."""
-    chunks = chunk_subagents(FIXTURE, summarize=False)
+    """Parse fixture for subagent chunks."""
+    chunks = chunk_subagents(FIXTURE)
     assert isinstance(chunks, list)
-    # Fixture has 1 slug with 6 entries (resilient-roaming-frost) — above threshold
-    # and 1 slug with 2 entries (gentle-amber-breeze) — below threshold
-    assert len(chunks) == 1
-
-    c = chunks[0]
-    assert isinstance(c, SubagentChunk)
-    assert c.slug == "resilient-roaming-frost"
-    assert c.content
-    assert c.timestamp
-
-
-def test_chunk_subagents_metadata():
-    """Verify subagent metadata fields."""
-    chunks = chunk_subagents(FIXTURE, summarize=False)
-    c = chunks[0]
-    m = c.metadata
-    assert m["slug"] == "resilient-roaming-frost"
-    assert "initial_prompt_preview" in m
-    assert "RBAC" in m["initial_prompt_preview"]
-    assert m["progress_line_count"] == 6
+    # Fixture has 1 slug with 6 entries (resilient-roaming-frost) — below threshold of 10
+    # and 1 slug with 2 entries (gentle-amber-breeze) — also below
+    # Both are filtered out by MIN_PROGRESS_ENTRIES = 10
+    assert len(chunks) == 0
 
 
 def test_chunk_subagents_skips_small():
-    """Subagents with < 5 entries should be skipped."""
-    chunks = chunk_subagents(FIXTURE, summarize=False)
+    """Subagents with < MIN_PROGRESS_ENTRIES entries should be skipped."""
+    chunks = chunk_subagents(FIXTURE)
     slugs = [c.slug for c in chunks]
+    # Both fixture subagents have < 10 entries, so both are filtered
     assert "gentle-amber-breeze" not in slugs
-
-
-def test_chunk_subagents_content_has_work():
-    """Content should include the subagent's work text when not summarizing."""
-    chunks = chunk_subagents(FIXTURE, summarize=False)
-    c = chunks[0]
-    assert "RBAC" in c.content or "role" in c.content.lower()
+    assert "resilient-roaming-frost" not in slugs

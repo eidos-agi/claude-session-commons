@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Session Intelligence — Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        :root { --pico-font-size: 15px; }
+        nav { margin-bottom: 1rem; }
+        .status-card {
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        .status-running { border-left: 4px solid #43a047; }
+        .status-idle { border-left: 4px solid #2196f3; }
+        .status-error { border-left: 4px solid #e53935; }
+        .status-stopped { border-left: 4px solid #757575; }
+        .status-unknown { border-left: 4px solid #ff9800; }
+
+        .grid-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+        .stat-box {
+            text-align: center;
+            padding: 0.75rem;
+            border-radius: 6px;
+            background: var(--pico-card-background-color);
+        }
+        .stat-box .value {
+            font-size: 1.8rem;
+            font-weight: bold;
+            display: block;
+        }
+        .stat-box .label {
+            font-size: 0.8rem;
+            opacity: 0.7;
+        }
+
+        .log-box {
+            background: #1a1a2e;
+            color: #a0ffa0;
+            font-family: monospace;
+            font-size: 0.8rem;
+            padding: 1rem;
+            border-radius: 6px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .session-table td { font-size: 0.85rem; }
+        .session-table .project { opacity: 0.6; font-size: 0.75rem; }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        .badge-running { background: #43a047; color: white; }
+        .badge-idle { background: #2196f3; color: white; }
+        .badge-error { background: #e53935; color: white; }
+        .badge-stopped { background: #757575; color: white; }
+        .badge-unknown { background: #ff9800; color: white; }
+    </style>
+</head>
+<body>
+    <nav class="container">
+        <ul><li><strong>Session Intelligence</strong></li></ul>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/dashboard" aria-current="page">Dashboard</a></li>
+            <li><a href="/playbooks">Playbooks</a></li>
+            <li><a href="/docs">API Docs</a></li>
+        </ul>
+    </nav>
+
+    <main class="container">
+        <!-- ── Daemon Status ────────────────────────── -->
+        <div id="status-card" class="status-card status-unknown">
+            <hgroup>
+                <h3>Daemon Status <span id="status-badge" class="badge badge-unknown">loading...</span></h3>
+                <p id="status-detail">Connecting...</p>
+            </hgroup>
+        </div>
+
+        <!-- ── Stats Grid ───────────────────────────── -->
+        <div class="grid-stats">
+            <div class="stat-box">
+                <span class="value" id="stat-chunks">--</span>
+                <span class="label">Total Chunks</span>
+            </div>
+            <div class="stat-box">
+                <span class="value" id="stat-turns">--</span>
+                <span class="label">Turns</span>
+            </div>
+            <div class="stat-box">
+                <span class="value" id="stat-subagents">--</span>
+                <span class="label">Subagents</span>
+            </div>
+            <div class="stat-box">
+                <span class="value" id="stat-sessions">--</span>
+                <span class="label">Sessions</span>
+            </div>
+            <div class="stat-box">
+                <span class="value" id="stat-processed">--</span>
+                <span class="label">Processed</span>
+            </div>
+            <div class="stat-box">
+                <span class="value" id="stat-failed">--</span>
+                <span class="label">Failed</span>
+            </div>
+        </div>
+
+        <!-- ── Recent Sessions ──────────────────────── -->
+        <details open>
+            <summary><h4 style="display:inline">Recent Sessions</h4></summary>
+            <table class="session-table">
+                <thead>
+                    <tr>
+                        <th>Title</th>
+                        <th>Project</th>
+                        <th>Age</th>
+                        <th>Size</th>
+                    </tr>
+                </thead>
+                <tbody id="sessions-body">
+                    <tr><td colspan="4">Loading...</td></tr>
+                </tbody>
+            </table>
+        </details>
+
+        <!-- ── Daemon Log ───────────────────────────── -->
+        <details>
+            <summary><h4 style="display:inline">Daemon Log</h4></summary>
+            <div class="log-box" id="log-box">Loading logs...</div>
+        </details>
+    </main>
+
+    <footer class="container">
+        <small>
+            claude-session-daemon observability dashboard
+            &middot; Model: <span id="footer-model">--</span>
+            &middot; Dim: <span id="footer-dim">--</span>
+        </small>
+    </footer>
+
+    <script>
+    function escHtml(s) {
+        if (!s) return '';
+        const div = document.createElement('div');
+        div.textContent = s;
+        return div.innerHTML;
+    }
+
+    function shortPath(p) {
+        if (!p) return '';
+        const parts = p.replace(/\/$/, '').split('/');
+        return parts.length > 2 ? '.../' + parts.slice(-2).join('/') : p;
+    }
+
+    async function fetchStatus() {
+        try {
+            const res = await fetch('/api/status');
+            const data = await res.json();
+            const card = document.getElementById('status-card');
+            const badge = document.getElementById('status-badge');
+            const detail = document.getElementById('status-detail');
+
+            const state = data.state || 'unknown';
+            card.className = 'status-card status-' + state;
+            badge.className = 'badge badge-' + state;
+            badge.textContent = state.toUpperCase();
+
+            let parts = [];
+            if (data.pid) parts.push('PID ' + data.pid);
+            if (data.version) parts.push('v' + data.version);
+            if (data.last_run) parts.push('Last run: ' + new Date(data.last_run).toLocaleTimeString());
+            if (data.queue_depth > 0) parts.push('Queue: ' + data.queue_depth);
+            if (data.error) parts.push('Error: ' + data.error);
+            detail.textContent = parts.join(' \u00b7 ') || 'No data';
+
+            const elProc = document.getElementById('stat-processed');
+            const elFail = document.getElementById('stat-failed');
+            if (elProc && data.sessions_processed !== undefined) elProc.textContent = data.sessions_processed;
+            if (elFail && data.sessions_failed !== undefined) elFail.textContent = data.sessions_failed;
+        } catch (e) {
+            console.warn('Status fetch failed:', e);
+        }
+    }
+
+    async function fetchStats() {
+        try {
+            const res = await fetch('/api/stats');
+            const data = await res.json();
+            const el = (id) => document.getElementById(id);
+            if (el('stat-chunks')) el('stat-chunks').textContent = data.total_chunks || 0;
+            if (el('stat-turns')) el('stat-turns').textContent = data.turns || 0;
+            if (el('stat-subagents')) el('stat-subagents').textContent = data.subagent_summaries || 0;
+            if (el('stat-sessions')) el('stat-sessions').textContent = data.sessions_indexed || 0;
+            if (el('footer-model')) el('footer-model').textContent = data.model_name || '--';
+            if (el('footer-dim')) el('footer-dim').textContent = data.embedding_dim || '--';
+        } catch (e) {
+            console.warn('Stats fetch failed:', e);
+        }
+    }
+
+    async function fetchSessions() {
+        try {
+            const res = await fetch('/api/sessions?limit=20');
+            const data = await res.json();
+            const tbody = document.getElementById('sessions-body');
+            if (!data.sessions || data.sessions.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4">No sessions found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = data.sessions.map(s => `
+                <tr>
+                    <td>${escHtml(s.title)}</td>
+                    <td class="project">${escHtml(shortPath(s.project_dir))}</td>
+                    <td>${escHtml(s.relative_time)}</td>
+                    <td>${escHtml(s.size)}</td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            console.warn('Sessions fetch failed:', e);
+        }
+    }
+
+    async function fetchLogs() {
+        try {
+            const res = await fetch('/api/logs?lines=50');
+            const data = await res.json();
+            const box = document.getElementById('log-box');
+            if (data.lines && data.lines.length > 0) {
+                box.textContent = data.lines.join('\n');
+                box.scrollTop = box.scrollHeight;
+            } else {
+                box.textContent = data.error || 'No log entries';
+            }
+        } catch (e) {
+            console.warn('Logs fetch failed:', e);
+        }
+    }
+
+    // Init
+    fetchStatus();
+    fetchStats();
+    fetchSessions();
+    fetchLogs();
+    setInterval(() => { fetchStatus(); fetchStats(); }, 30000);
+    setInterval(fetchLogs, 60000);
+    </script>
+</body>
+</html>

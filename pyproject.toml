@@ -15,9 +15,12 @@ dependencies = [
 [project.scripts]
 claude-session-daemon = "claude_session_commons.daemon:main"
 claude-find = "claude_session_commons.cli_find:main"
+claude-session-web = "claude_session_commons.web.app:main"
+claude-session-reindex = "claude_session_commons.reindex:main"
 
 [project.optional-dependencies]
 insights = ["sqlite-vec", "fastembed>=0.2.0", "pysqlite3"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "jinja2>=3.1", "sse-starlette>=2.0", "claude-code-sdk>=0.0.25"]
 train = ["pandas", "scikit-learn"]
 
 [tool.setuptools.packages.find]

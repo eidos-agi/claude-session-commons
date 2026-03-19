@@ -1,5 +1,8 @@
 """Read and analyze past chat logs from ~/.claude/chat-logs/.
 
+NOTE: Legacy — superseded by web dashboard RAG interface.
+Still used by ChatAgent (chat_agent.py). Do not extend.
+
 Each log is a JSONL file with events: start, user, assistant, resume, end.
 This module aggregates them into structured data the ChatAgent can inject
 into its system prompt — no re-running conversations needed.

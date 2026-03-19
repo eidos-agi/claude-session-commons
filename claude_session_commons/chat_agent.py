@@ -1,5 +1,8 @@
 """Conversational chat agent for session discovery.
 
+NOTE: Legacy — superseded by web dashboard RAG interface.
+Still used by TUI (chat_screen.py, session_picker.py). Do not extend.
+
 Uses claude -p (CLI) for all LLM calls. Never imports anthropic SDK.
 Two-tier intelligence:
   Tier 1: Top ~50 sessions with metadata baked into the system prompt

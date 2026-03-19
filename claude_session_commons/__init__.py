@@ -42,16 +42,16 @@ Public API:
     summarize_deep(context, project_dir, quick_summary, git) -> dict
     analyze_patterns(context, project_dir, summary) -> dict
 
-    # Chat agent
+    # Chat agent (legacy — use web dashboard RAG interface instead)
     ChatAgent(sessions, summaries, cache)
 
-    # Chat history
+    # Chat history (legacy — use web dashboard RAG interface instead)
     load_recent() -> list[ChatConversation]
 """
 
 from .cache import SessionCache
-from .chat_agent import ChatAgent
-from .chat_history import ChatConversation, load_recent, search_chats
+# NOTE: ChatAgent/ChatConversation still importable directly from their modules
+# but removed from the public API — superseded by web dashboard RAG interface
 from .classify import (
     classify_session,
     get_label,
@@ -69,8 +69,6 @@ from .summarize import analyze_patterns, summarize_deep, summarize_quick
 from .tail import get_tail_info
 
 __all__ = [
-    "ChatAgent",
-    "ChatConversation",
     "SessionCache",
     "classify_session",
     "decode_project_path",
@@ -94,6 +92,4 @@ __all__ = [
     "summarize_quick",
     "summarize_deep",
     "analyze_patterns",
-    "load_recent",
-    "search_chats",
 ]

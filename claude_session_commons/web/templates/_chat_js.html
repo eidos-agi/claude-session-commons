@@ -1,0 +1,284 @@
+{# Shared chat JavaScript — included by home.html, chat.html, playbooks.html
+   Requires: chatId variable set before this include, marked.js, DOMPurify loaded #}
+
+<script>
+var sseTarget = document.getElementById('sse-target');
+var chatMessages = document.getElementById('chat-messages');
+var workingBar = document.getElementById('working-bar');
+var workingStatus = document.getElementById('working-status');
+var workingElapsed = document.getElementById('working-elapsed');
+var sendBtn = document.getElementById('send-btn');
+
+// ── Reload saved chat ──────────────────────────────────────
+var reloadMessages = {{ reload_messages|default('[]')|safe }};
+var reloadTitle = '{{ reload_title|default("")|e }}';
+
+if (reloadMessages.length > 0) {
+    var banner = document.createElement('div');
+    banner.className = 'reload-banner';
+    banner.textContent = 'Loaded saved chat: ' + reloadTitle;
+    sseTarget.appendChild(banner);
+
+    reloadMessages.forEach(function(msg) {
+        var div = document.createElement('div');
+        if (msg.role === 'user') {
+            div.className = 'chat-msg user';
+            div.textContent = msg.content;
+        } else {
+            div.className = 'chat-msg assistant';
+            div.innerHTML = DOMPurify.sanitize(marked.parse(msg.content));
+        }
+        sseTarget.appendChild(div);
+    });
+    scrollToBottom();
+}
+
+// ── Chat history dropdown ──────────────────────────────────
+function toggleHistory(e) {
+    e.preventDefault();
+    var dd = document.getElementById('chat-history-dropdown');
+    if (dd.classList.contains('open')) {
+        dd.classList.remove('open');
+        return;
+    }
+    dd.classList.add('open');
+    loadHistory();
+}
+
+document.addEventListener('click', function(e) {
+    var dd = document.getElementById('chat-history-dropdown');
+    if (dd && !e.target.closest('.chat-history-btn')) {
+        dd.classList.remove('open');
+    }
+});
+
+async function loadHistory() {
+    var dd = document.getElementById('chat-history-dropdown');
+    try {
+        var res = await fetch('/api/chat/history?limit=15');
+        var data = await res.json();
+        if (!data.chats || data.chats.length === 0) {
+            dd.innerHTML = '<div class="chat-history-empty">No saved chats yet</div>';
+            return;
+        }
+        dd.innerHTML = data.chats.map(function(c) {
+            var age = timeAgo(c.updated_at);
+            return '<div class="chat-history-item" onclick="window.location=\'/?reload=' +
+                encodeURIComponent(c.id) + '\'">' +
+                '<div class="title">' + escHtml(c.title) + '</div>' +
+                '<div class="time">' + age + '</div></div>';
+        }).join('');
+    } catch (e) {
+        dd.innerHTML = '<div class="chat-history-empty">Failed to load history</div>';
+    }
+}
+
+function timeAgo(iso) {
+    var d = new Date(iso);
+    var now = new Date();
+    var sec = Math.floor((now - d) / 1000);
+    if (sec < 60) return 'just now';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+    if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+    return Math.floor(sec / 86400) + 'd ago';
+}
+
+function escHtml(s) {
+    if (!s) return '';
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+function scrollToBottom() {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// ── Working state ──────────────────────────────────────────
+var workingStartTime = null;
+var workingTimer = null;
+var toolCallCount = 0;
+
+function startWorking() {
+    workingStartTime = Date.now();
+    toolCallCount = 0;
+    workingBar.classList.add('active');
+    workingStatus.textContent = 'Thinking...';
+    workingElapsed.textContent = '0s';
+    sendBtn.disabled = true;
+
+    if (workingTimer) clearInterval(workingTimer);
+    workingTimer = setInterval(function() {
+        var elapsed = Math.floor((Date.now() - workingStartTime) / 1000);
+        if (elapsed < 60) {
+            workingElapsed.textContent = elapsed + 's';
+        } else {
+            var m = Math.floor(elapsed / 60);
+            var s = elapsed % 60;
+            workingElapsed.textContent = m + 'm ' + s + 's';
+        }
+    }, 1000);
+}
+
+function stopWorking() {
+    workingBar.classList.remove('active');
+    sendBtn.disabled = false;
+    if (workingTimer) { clearInterval(workingTimer); workingTimer = null; }
+    workingStartTime = null;
+    // Hook for post-working actions (e.g., playbooks refreshes list)
+    if (typeof onAgentDone === 'function') onAgentDone();
+}
+
+function updateWorkingStatus(text) {
+    if (workingBar.classList.contains('active')) {
+        workingStatus.textContent = text;
+    }
+}
+
+// ── SSE Connection ─────────────────────────────────────────
+var evtSource = null;
+var activeStreamDiv = null;
+var renderTimer = null;
+
+function connectSSE() {
+    if (evtSource) evtSource.close();
+    evtSource = new EventSource('/api/chat/sse?chat_id=' + chatId);
+
+    evtSource.addEventListener('message', function(e) {
+        appendHTML(e.data);
+        if (e.data.indexOf('tool-details') !== -1) {
+            toolCallCount++;
+            var match = e.data.match(/>([^<(]+)\(/);
+            if (match) {
+                updateWorkingStatus('Running ' + match[1].trim() + '... (' + toolCallCount + ')');
+            } else {
+                updateWorkingStatus('Running tools... (' + toolCallCount + ')');
+            }
+        }
+    });
+
+    evtSource.addEventListener('tool_result', function(e) {
+        appendHTML(e.data);
+        injectToolResults();
+        updateWorkingStatus('Processing results...');
+    });
+
+    evtSource.addEventListener('stream_start', function(e) {
+        updateWorkingStatus('Generating response...');
+        activeStreamDiv = document.createElement('div');
+        activeStreamDiv.className = 'chat-msg assistant streaming';
+        activeStreamDiv._rawText = '';
+        activeStreamDiv.innerHTML = '<span class="cursor"></span>';
+        sseTarget.appendChild(activeStreamDiv);
+        scrollToBottom();
+    });
+
+    evtSource.addEventListener('stream_delta', function(e) {
+        if (!activeStreamDiv) return;
+        var data = JSON.parse(e.data);
+        activeStreamDiv._rawText += data.text;
+        scheduleMarkdownRender(activeStreamDiv);
+    });
+
+    evtSource.addEventListener('stream_end', function(e) {
+        if (!activeStreamDiv) return;
+        var raw = activeStreamDiv._rawText || '';
+        activeStreamDiv.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+        activeStreamDiv.classList.remove('streaming');
+        activeStreamDiv = null;
+        if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+        scrollToBottom();
+    });
+
+    evtSource.addEventListener('done', function(e) {
+        stopWorking();
+        if (e.data) appendHTML(e.data);
+        evtSource.close();
+        evtSource = null;
+    });
+
+    evtSource.addEventListener('error', function(e) {
+        stopWorking();
+        if (e.data) appendHTML(e.data);
+    });
+}
+
+connectSSE();
+
+document.getElementById('chat-form').addEventListener('htmx:afterRequest', function() {
+    setTimeout(connectSSE, 100);
+});
+
+// ── Helpers ────────────────────────────────────────────────
+
+function appendHTML(html) {
+    if (!html) return;
+    var wrapper = document.createElement('div');
+    wrapper.innerHTML = html;
+    while (wrapper.firstChild) {
+        var node = wrapper.firstChild;
+        sseTarget.appendChild(node);
+        if (node.nodeType === 1) {
+            if (node.classList && node.classList.contains('markdown-pending')) {
+                renderMarkdown(node);
+            }
+            if (node.querySelectorAll) {
+                node.querySelectorAll('.markdown-pending').forEach(renderMarkdown);
+            }
+        }
+    }
+    scrollToBottom();
+}
+
+function decodeBase64UTF8(b64) {
+    var binStr = atob(b64);
+    var bytes = new Uint8Array(binStr.length);
+    for (var i = 0; i < binStr.length; i++) {
+        bytes[i] = binStr.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+}
+
+function renderMarkdown(el) {
+    try {
+        var raw = decodeBase64UTF8(el.dataset.rawText);
+        el.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+        el.classList.remove('markdown-pending');
+    } catch(e) {
+        el.textContent = el.dataset.rawText || '';
+        el.classList.remove('markdown-pending');
+    }
+}
+
+function scheduleMarkdownRender(div) {
+    if (renderTimer) return;
+    renderTimer = setTimeout(function() {
+        var raw = div._rawText || '';
+        var cursor = '<span class="cursor"></span>';
+        div.innerHTML = DOMPurify.sanitize(marked.parse(raw)) + cursor;
+        scrollToBottom();
+        renderTimer = null;
+    }, 50);
+}
+
+function injectToolResults() {
+    document.querySelectorAll('.tool-result[data-tool-id]').forEach(function(el) {
+        var toolId = el.dataset.toolId;
+        var details = document.getElementById('tool-' + toolId);
+        if (details) {
+            var placeholder = details.querySelector('.tool-result-placeholder');
+            if (placeholder) { placeholder.replaceWith(el); }
+        }
+    });
+}
+
+function clearInput(form) {
+    var input = form.querySelector('#chat-input');
+    input.value = '';
+    input.focus();
+}
+
+document.getElementById('chat-form').addEventListener('submit', function(e) {
+    if (sendBtn.disabled) { e.preventDefault(); }
+});
+</script>

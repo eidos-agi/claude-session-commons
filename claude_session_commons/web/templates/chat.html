@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Session Intelligence — Chat</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+    <style>
+        :root { --pico-font-size: 15px; }
+        nav { margin-bottom: 0; }
+
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 80px);
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 0 1rem;
+        }
+        /* Override split-pane panel styles for standalone full-width layout */
+        .chat-container .chat-panel {
+            border-left: none;
+            padding-left: 0;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        {% include '_chat_css.html' %}
+    </style>
+</head>
+<body>
+    <nav class="container">
+        <ul><li><strong>Session Intelligence</strong></li></ul>
+        <ul>
+            <li><a href="/">Home</a></li>
+            <li><a href="/dashboard">Dashboard</a></li>
+            <li><a href="/chat" aria-current="page">Chat</a></li>
+            <li><a href="/playbooks">Playbooks</a></li>
+            <li><a href="/docs">API Docs</a></li>
+        </ul>
+    </nav>
+
+    <div class="chat-container">
+        {% include '_chat_panel.html' %}
+    </div>
+
+    <script>
+    var chatId = '{{ chat_id }}';
+    </script>
+    {% include '_chat_js.html' %}
+</body>
+</html>

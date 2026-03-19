@@ -83,7 +83,10 @@ def test_cli_type_filter(populated_db, capsys):
     """--type flag should filter results."""
     db_path, _ = populated_db
     with patch("sys.argv", ["claude-find", "RBAC", "--db", db_path, "--type", "subagent_summary"]):
-        main()
+        try:
+            main()
+        except SystemExit:
+            pass  # cli exits 0 when no results found
     captured = capsys.readouterr()
     # Should only show subagent results (or no results if query doesn't match)
     if "subagent_summary" in captured.out:

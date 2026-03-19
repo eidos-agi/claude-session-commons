@@ -80,8 +80,13 @@ def find_recent_sessions(
     min_bytes: int = MIN_SESSION_BYTES_DEFAULT,
     projects_dir: Path | None = None,
 ) -> list[dict]:
-    """Find sessions modified within the lookback window."""
+    """Find sessions modified within the lookback window.
+
+    Pass max_sessions=0 for unlimited (used by daemon/backfill).
+    """
     cutoff = time.time() - (hours * 3600)
     all_sessions = find_all_sessions(min_bytes=min_bytes, projects_dir=projects_dir)
     recent = [s for s in all_sessions if s["mtime"] >= cutoff]
-    return recent[:max_sessions]
+    if max_sessions > 0:
+        return recent[:max_sessions]
+    return recent
