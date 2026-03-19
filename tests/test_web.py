@@ -150,10 +150,10 @@ def test_search_validates_input(client):
 def test_dashboard_page(client):
     """Dashboard page returns HTML."""
     tc, tmp, _, _ = client
-    resp = tc.get("/")
+    resp = tc.get("/dashboard")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert "Session Daemon" in resp.text
+    assert "Daemon Status" in resp.text
 
 
 def test_search_page(client):
@@ -162,7 +162,7 @@ def test_search_page(client):
     resp = tc.get("/search")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert "Search Playground" in resp.text
+    assert "Search" in resp.text
 
 
 def test_api_docs_page(client):
