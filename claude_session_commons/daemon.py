@@ -943,6 +943,104 @@ def _process_task_files(
     return count
 
 
+# ── Web child (claude-resume-duet) ───────────────────────────
+# The main daemon owns the lifecycle of the claude-resume-duet-serve
+# subprocess. Clean separation: no shared memory, just HTTP pings.
+
+import subprocess as _subprocess
+import shutil as _shutil
+import urllib.request as _urllib_request
+
+CRD_PORT = 8412
+CRD_HEALTH_URL = f"http://localhost:{CRD_PORT}/health"
+CRD_NOTIFY_URL = f"http://localhost:{CRD_PORT}/notify"
+CRD_BACKOFF_SECS = [5, 10, 30, 60]  # restart delay sequence
+
+_web_child: "_subprocess.Popen | None" = None
+_web_restart_count = 0
+
+
+def _crd_binary() -> str | None:
+    """Return path to claude-resume-duet-serve, or None if not installed."""
+    return _shutil.which("claude-resume-duet-serve")
+
+
+def _crd_healthy() -> bool:
+    """Quick health check — returns True if the web child responds."""
+    try:
+        with _urllib_request.urlopen(CRD_HEALTH_URL, timeout=3) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _start_web_child(logger: logging.Logger) -> bool:
+    """Spawn claude-resume-duet-serve. Returns True on success."""
+    global _web_child, _web_restart_count
+    binary = _crd_binary()
+    if not binary:
+        return False  # not installed — skip silently
+    try:
+        log_out = open(CLAUDE_DIR / "crd-stdout.log", "a")
+        log_err = open(CLAUDE_DIR / "crd-stderr.log", "a")
+        _web_child = _subprocess.Popen(
+            [binary],
+            stdout=log_out,
+            stderr=log_err,
+            close_fds=True,
+        )
+        logger.info("Web child started (pid=%d, port=%d)", _web_child.pid, CRD_PORT)
+        _web_restart_count += 1
+        return True
+    except Exception as e:
+        logger.warning("Failed to start web child: %s", e)
+        _web_child = None
+        return False
+
+
+def _check_web_child(logger: logging.Logger):
+    """Restart the web child if it has died or become unresponsive. Called each poll cycle."""
+    global _web_child
+    if _web_child is None:
+        _start_web_child(logger)
+        return
+    # Process exited OR health check fails → restart
+    if _web_child.poll() is not None or not _crd_healthy():
+        rc = _web_child.returncode
+        delay = CRD_BACKOFF_SECS[min(_web_restart_count, len(CRD_BACKOFF_SECS) - 1)]
+        logger.warning("Web child exited (rc=%d), restarting in %ds", rc, delay)
+        _web_child = None
+        time.sleep(delay)
+        _start_web_child(logger)
+
+
+def _notify_web_child():
+    """Ping the web child after a scan so it refreshes its session list."""
+    try:
+        req = _urllib_request.Request(CRD_NOTIFY_URL, method="POST", data=b"")
+        with _urllib_request.urlopen(req, timeout=2):
+            pass
+    except Exception:
+        pass  # fire-and-forget — web child may be starting up
+
+
+def _stop_web_child(logger: logging.Logger):
+    """Terminate the web child on daemon shutdown."""
+    global _web_child
+    if _web_child is None:
+        return
+    try:
+        _web_child.terminate()
+        _web_child.wait(timeout=5)
+        logger.info("Web child stopped")
+    except Exception:
+        try:
+            _web_child.kill()
+        except Exception:
+            pass
+    _web_child = None
+
+
 # ── Main loop ────────────────────────────────────────────────
 
 def _run_loop(shutdown: threading.Event, logger: logging.Logger):
@@ -989,6 +1087,9 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
 
     _DAEMON_STATUS["state"] = "running"
     _write_status()
+
+    # Start web child (claude-resume-duet) — managed subprocess
+    _start_web_child(logger)
 
     logger.info(
         "Daemon started (pid=%d, poll=%ds, idle=%ds, llm=%s)",
@@ -1144,6 +1245,9 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
             _DAEMON_STATUS["state"] = "idle"
             _write_status()
 
+            # Ping web child to refresh its session list
+            _notify_web_child()
+
         except Exception as e:
             logger.error("Error in poll cycle: %s", e, exc_info=True)
             _DAEMON_STATUS["last_error"] = str(e)
@@ -1159,11 +1263,16 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
                 tasks_done = _process_task_files(caches, shutdown, logger)
                 _DAEMON_STATUS["tasks_processed"] += tasks_done
 
+        # Health-check web child at the top of each cycle
+        _check_web_child(logger)
         _DAEMON_STATUS["state"] = "running"
 
     # Shutdown status
     _DAEMON_STATUS["state"] = "stopping"
     _write_status()
+
+    # Stop web child before draining queue
+    _stop_web_child(logger)
 
     # Drain LLM queue and stop worker
     _stop_llm_worker()
