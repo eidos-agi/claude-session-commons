@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "claude-session-commons"
 version = "0.1.0"
 description = "Shared session discovery, caching, and classification for Claude Code tools"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
@@ -17,11 +18,29 @@ claude-session-daemon = "claude_session_commons.daemon:main"
 claude-find = "claude_session_commons.cli_find:main"
 claude-session-web = "claude_session_commons.web.app:main"
 claude-session-reindex = "claude_session_commons.reindex:main"
+claude-summarizer-dataset = "claude_session_commons.summarizer.dataset:main"
+claude-summarizer-train = "claude_session_commons.summarizer.train:main"
+claude-summarizer-evaluate = "claude_session_commons.summarizer.evaluate:main"
+claude-summarizer-export = "claude_session_commons.summarizer.export:main"
+claude-summarizer-inference = "claude_session_commons.summarizer.inference:main"
 
 [project.optional-dependencies]
 insights = ["sqlite-vec", "fastembed>=0.2.0", "pysqlite3"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "jinja2>=3.1", "sse-starlette>=2.0", "claude-code-sdk>=0.0.25"]
-train = ["pandas", "scikit-learn"]
+train = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "torch>=2.2",
+    "rouge-score>=0.1.2",
+    "sentencepiece>=0.1.99",
+    "pandas",
+    "scikit-learn",
+]
+onnx = [
+    "onnxruntime>=1.17",
+    "optimum[onnxruntime]>=1.18",
+    "tokenizers>=0.19",
+]
 
 [tool.setuptools.packages.find]
 include = ["claude_session_commons*"]
