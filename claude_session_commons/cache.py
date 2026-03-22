@@ -37,8 +37,11 @@ class SessionCache:
             mtime = 0
         return hashlib.md5(f"{session_file}:{mtime}".encode()).hexdigest()
 
-    # Fields that persist across cache_key changes (human-authored, not AI-derived)
-    _PERSISTENT_FIELDS = frozenset({"bookmark", "last_seen"})
+    # Fields that persist across cache_key changes.
+    # - Human-authored fields (bookmark, last_seen) persist because the user wrote them.
+    # - classification persists because session origin (human vs AI-spawned) is an
+    #   intrinsic property of the session — it doesn't change when new messages arrive.
+    _PERSISTENT_FIELDS = frozenset({"bookmark", "last_seen", "classification"})
 
     def get(self, session_id: str, cache_key: str, field: str):
         """Get a cached field. Returns None if stale or missing.

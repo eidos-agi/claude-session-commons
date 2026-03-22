@@ -98,6 +98,74 @@ def _load_sessions() -> bool:
         return False
 
 
+def _load_model(model_dir: str) -> bool:
+    """Load ONNX model from a local directory (for evaluation before HF upload).
+
+    Sets module-level singletons from model_dir instead of CACHE_DIR.
+    Returns True if successful.
+    """
+    global _enc_session, _dec_session, _tokenizer
+    dirpath = Path(model_dir)
+
+    enc_path = dirpath / "encoder_model.onnx"
+    dec_path = dirpath / "decoder_model.onnx"
+    tok_path = dirpath / "tokenizer.json"
+
+    if not (enc_path.exists() and dec_path.exists() and tok_path.exists()):
+        print(f"[summarizer] Missing ONNX files in {model_dir}")
+        return False
+
+    try:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        _enc_session = ort.InferenceSession(str(enc_path))
+        _dec_session = ort.InferenceSession(str(dec_path))
+        _tokenizer = Tokenizer.from_file(str(tok_path))
+        return True
+    except Exception as e:
+        print(f"[summarizer] Failed to load from {model_dir}: {e}")
+        _enc_session = _dec_session = _tokenizer = None
+        return False
+
+
+def _run_inference(text: str, max_new_tokens: int = 80, repetition_penalty: float = 1.3) -> Optional[str]:
+    """Run inference using already-loaded singletons. Call _load_model() first."""
+    import numpy as np
+
+    if _enc_session is None or _tokenizer is None:
+        return None
+
+    inp = "summarize: " + text.strip()
+    enc_out = _tokenizer.encode(inp)
+    ids = np.array([enc_out.ids], dtype=np.int64)
+    mask = np.array([enc_out.attention_mask], dtype=np.int64)
+
+    hidden = _enc_session.run(None, {"input_ids": ids, "attention_mask": mask})[0]
+    decoder_ids = np.array([[0]], dtype=np.int64)
+    generated: list[int] = []
+
+    for _ in range(max_new_tokens):
+        logits = _dec_session.run(None, {
+            "input_ids": decoder_ids,
+            "encoder_hidden_states": hidden,
+            "encoder_attention_mask": mask,
+        })[0]
+        next_logits = logits[0, -1].copy()
+        for prev in generated:
+            if next_logits[prev] > 0:
+                next_logits[prev] /= repetition_penalty
+            else:
+                next_logits[prev] *= repetition_penalty
+        next_token = int(np.argmax(next_logits))
+        if next_token == 1:
+            break
+        generated.append(next_token)
+        decoder_ids = np.concatenate([decoder_ids, [[next_token]]], axis=1)
+
+    return _tokenizer.decode(generated, skip_special_tokens=True).strip() or None
+
+
 def is_available(model_url: str = DEFAULT_MODEL_URL) -> bool:
     """Return True if the summarizer is ready to use.
 
@@ -127,42 +195,9 @@ def summarize(
         repetition_penalty: Penalty for repeating tokens. 1.3 reduces looping.
         model_url: URL prefix to download model files from if not cached.
     """
-    import numpy as np
-
     if not is_available(model_url):
         return None
-
-    inp = "summarize: " + text.strip()
-    enc_out = _tokenizer.encode(inp)
-    ids = np.array([enc_out.ids], dtype=np.int64)
-    mask = np.array([enc_out.attention_mask], dtype=np.int64)
-
-    # Encode
-    hidden = _enc_session.run(None, {"input_ids": ids, "attention_mask": mask})[0]
-
-    # Greedy decode with repetition penalty
-    decoder_ids = np.array([[0]], dtype=np.int64)
-    generated: list[int] = []
-
-    for _ in range(max_new_tokens):
-        logits = _dec_session.run(None, {
-            "input_ids": decoder_ids,
-            "encoder_hidden_states": hidden,
-            "encoder_attention_mask": mask,
-        })[0]
-        next_logits = logits[0, -1].copy()
-        for prev in generated:
-            if next_logits[prev] > 0:
-                next_logits[prev] /= repetition_penalty
-            else:
-                next_logits[prev] *= repetition_penalty
-        next_token = int(np.argmax(next_logits))
-        if next_token == 1:  # EOS
-            break
-        generated.append(next_token)
-        decoder_ids = np.concatenate([decoder_ids, [[next_token]]], axis=1)
-
-    return _tokenizer.decode(generated, skip_special_tokens=True).strip() or None
+    return _run_inference(text, max_new_tokens=max_new_tokens, repetition_penalty=repetition_penalty)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

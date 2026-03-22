@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-from pathlib import Path
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -40,12 +38,25 @@ def build_hf_dataset(rows: list[dict]):
     """Convert list of dicts to a HuggingFace Dataset with train/eval split."""
     from datasets import Dataset
 
-    # T5 summarization convention: prepend task prefix
+    # Use pre-built input_text (origin-conditioned) when present in dataset rows.
+    # Falls back to generic "summarize: " prefix for older datasets.
     dataset = Dataset.from_list([
-        {"input_text": "summarize: " + r["window_text"], "target_text": r["summary"]}
+        {
+            "input_text": r.get("input_text") or ("summarize: " + r["window_text"]),
+            "target_text": r["summary"],
+            "origin": r.get("origin", "unknown"),
+        }
         for r in rows
     ])
     split = dataset.train_test_split(test_size=0.1, seed=42)
+
+    # Log origin distribution
+    for split_name, ds in [("train", split["train"]), ("eval", split["test"])]:
+        origins = {}
+        for o in ds["origin"]:
+            origins[o] = origins.get(o, 0) + 1
+        print(f"  {split_name}: {dict(origins)}")
+
     return split["train"], split["test"]
 
 
@@ -79,7 +90,9 @@ def train(
         Seq2SeqTrainer,
         Seq2SeqTrainingArguments,
         DataCollatorForSeq2Seq,
+        EvalPrediction,  # noqa: F401 — used in compute_metrics type hint
     )
+    import numpy as np  # noqa: F401 — used in compute_metrics
     import torch
 
     print(f"Loading base model: {base_model}")
@@ -140,6 +153,34 @@ def train(
 
     collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
 
+    def compute_metrics(pred: EvalPrediction) -> dict:
+        """Compute ROUGE scores after each eval epoch."""
+        try:
+            from rouge_score import rouge_scorer as rs_mod
+        except ImportError:
+            return {}
+
+        scorer = rs_mod.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+
+        labels = pred.label_ids
+        preds = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+
+        # Replace -100 (padding) with pad token id before decoding
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        totals: dict[str, float] = {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
+        for p, r in zip(decoded_preds, decoded_labels):
+            scores = scorer.score(r, p)
+            for key in totals:
+                totals[key] += scores[key].fmeasure
+
+        n = max(len(decoded_preds), 1)
+        results = {k: round(v / n, 4) for k, v in totals.items()}
+        print(f"\n  ROUGE: {results}")
+        return results
+
     trainer = Seq2SeqTrainer(
         model=model,
         args=args,
@@ -147,9 +188,10 @@ def train(
         eval_dataset=eval_ds,
         tokenizer=tokenizer,
         data_collator=collator,
+        compute_metrics=compute_metrics,
     )
 
-    print("Training…")
+    print("Training...")
     trainer.train()
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
