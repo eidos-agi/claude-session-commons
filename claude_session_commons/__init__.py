@@ -42,6 +42,10 @@ Public API:
     summarize_deep(context, project_dir, quick_summary, git) -> dict
     analyze_patterns(context, project_dir, summary) -> dict
 
+    # Hierarchical summaries (L2 project, L3 portfolio)
+    generate_project_summary(project_path, conn, cache) -> dict
+    summarize_portfolio(project_summaries) -> dict
+
     # Chat agent (legacy — use web dashboard RAG interface instead)
     ChatAgent(sessions, summaries, cache)
 

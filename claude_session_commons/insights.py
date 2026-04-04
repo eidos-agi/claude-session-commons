@@ -182,6 +182,43 @@ def init_db(conn: sqlite3.Connection):
             updated_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         );
+
+        -- Projects — aggregate sessions by project_path
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            session_count INTEGER NOT NULL DEFAULT 0,
+            last_activity TEXT,
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_projects_path ON projects(path);
+
+        -- Hierarchical summaries (L1=session, L2=project, L3=portfolio)
+        CREATE TABLE IF NOT EXISTS summary_levels (
+            id TEXT PRIMARY KEY,
+            level INTEGER NOT NULL
+                CHECK(level IN (1, 2, 3)),
+            entity_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL
+                CHECK(entity_type IN ('session', 'project', 'portfolio')),
+            title TEXT NOT NULL,
+            summary_text TEXT NOT NULL,
+            source_ids TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            updated_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_summary_entity
+            ON summary_levels(entity_type, entity_id);
+        CREATE INDEX IF NOT EXISTS idx_summary_level
+            ON summary_levels(level);
     """)
     conn.commit()
     _migrate_chunk_type_check(conn)
@@ -443,6 +480,13 @@ def index_session(
                            VALUES (?, ?, 'file_path', ?)""",
                         (anchor_chunk_id, session_id, f),
                     )
+
+    # Update project stats after indexing
+    if turn_count or subagent_count:
+        try:
+            update_project_stats(conn, project_path)
+        except Exception:
+            pass  # Non-critical — backfill_projects can catch up
 
     return (turn_count, subagent_count)
 
@@ -781,3 +825,215 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         "model_name": meta.get("model_name", "unknown"),
         "embedding_dim": meta.get("embedding_dim", "unknown"),
     }
+
+
+# ── Projects ─────────────────────────────────────────────────
+
+def backfill_projects(conn: sqlite3.Connection) -> int:
+    """Populate projects table from distinct project_paths in chunks.
+
+    Inserts new projects and updates session_count/last_activity for
+    existing ones. Returns number of projects upserted.
+    """
+    rows = conn.execute(
+        """SELECT project_path,
+                  COUNT(DISTINCT session_id) AS session_count,
+                  MAX(timestamp) AS last_activity
+           FROM chunks
+           GROUP BY project_path"""
+    ).fetchall()
+
+    count = 0
+    now = datetime.now().isoformat()
+    for path, session_count, last_activity in rows:
+        # Derive name from last path component
+        name = Path(path).name if path else "unknown"
+        project_id = str(uuid.uuid5(uuid.NAMESPACE_URL, path))
+        conn.execute(
+            """INSERT INTO projects (id, path, name, session_count, last_activity, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(path) DO UPDATE SET
+                   session_count = excluded.session_count,
+                   last_activity = excluded.last_activity,
+                   updated_at = excluded.updated_at""",
+            (project_id, path, name, session_count, last_activity, now),
+        )
+        count += 1
+    conn.commit()
+    return count
+
+
+def update_project_stats(conn: sqlite3.Connection, project_path: str):
+    """Update a single project's session_count and last_activity after indexing."""
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT session_id), MAX(timestamp)
+           FROM chunks WHERE project_path = ?""",
+        (project_path,),
+    ).fetchone()
+    if not row or not row[0]:
+        return
+
+    session_count, last_activity = row
+    now = datetime.now().isoformat()
+    name = Path(project_path).name if project_path else "unknown"
+    project_id = str(uuid.uuid5(uuid.NAMESPACE_URL, project_path))
+    conn.execute(
+        """INSERT INTO projects (id, path, name, session_count, last_activity, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(path) DO UPDATE SET
+               session_count = excluded.session_count,
+               last_activity = excluded.last_activity,
+               updated_at = excluded.updated_at""",
+        (project_id, project_path, name, session_count, last_activity, now),
+    )
+    conn.commit()
+
+
+def list_projects(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    """List all projects, ordered by last_activity descending."""
+    rows = conn.execute(
+        """SELECT id, path, name, session_count, last_activity, created_at, updated_at
+           FROM projects
+           ORDER BY last_activity DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "path": r[1], "name": r[2],
+            "session_count": r[3], "last_activity": r[4],
+            "created_at": r[5], "updated_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def get_project(conn: sqlite3.Connection, project_path: str) -> dict | None:
+    """Get a single project by path."""
+    row = conn.execute(
+        "SELECT id, path, name, session_count, last_activity FROM projects WHERE path = ?",
+        (project_path,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "path": row[1], "name": row[2],
+        "session_count": row[3], "last_activity": row[4],
+    }
+
+
+# ── Summary Levels ───────────────────────────────────────────
+
+def get_summary(
+    conn: sqlite3.Connection,
+    entity_type: str,
+    entity_id: str,
+    level: int | None = None,
+) -> dict | None:
+    """Get the most recent summary for an entity."""
+    if level is not None:
+        row = conn.execute(
+            """SELECT id, level, entity_id, entity_type, title, summary_text,
+                      source_ids, created_at, updated_at
+               FROM summary_levels
+               WHERE entity_type = ? AND entity_id = ? AND level = ?
+               ORDER BY updated_at DESC LIMIT 1""",
+            (entity_type, entity_id, level),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT id, level, entity_id, entity_type, title, summary_text,
+                      source_ids, created_at, updated_at
+               FROM summary_levels
+               WHERE entity_type = ? AND entity_id = ?
+               ORDER BY level DESC, updated_at DESC LIMIT 1""",
+            (entity_type, entity_id),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "level": row[1], "entity_id": row[2],
+        "entity_type": row[3], "title": row[4], "summary_text": row[5],
+        "source_ids": json.loads(row[6]), "created_at": row[7],
+        "updated_at": row[8],
+    }
+
+
+def upsert_summary(
+    conn: sqlite3.Connection,
+    level: int,
+    entity_id: str,
+    entity_type: str,
+    title: str,
+    summary_text: str,
+    source_ids: list[str] | None = None,
+) -> str:
+    """Insert or update a summary. Returns the summary ID."""
+    now = datetime.now().isoformat()
+    sources_json = json.dumps(source_ids or [])
+
+    # Check for existing summary at this level+entity
+    existing = conn.execute(
+        """SELECT id FROM summary_levels
+           WHERE level = ? AND entity_id = ? AND entity_type = ?""",
+        (level, entity_id, entity_type),
+    ).fetchone()
+
+    if existing:
+        summary_id = existing[0]
+        conn.execute(
+            """UPDATE summary_levels
+               SET title = ?, summary_text = ?, source_ids = ?, updated_at = ?
+               WHERE id = ?""",
+            (title, summary_text, sources_json, now, summary_id),
+        )
+    else:
+        summary_id = str(uuid.uuid4())
+        conn.execute(
+            """INSERT INTO summary_levels
+               (id, level, entity_id, entity_type, title, summary_text, source_ids, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (summary_id, level, entity_id, entity_type, title, summary_text, sources_json, now),
+        )
+    conn.commit()
+    return summary_id
+
+
+def get_project_summary(conn: sqlite3.Connection, project_path: str) -> dict | None:
+    """Convenience: get the L2 project summary for a project path."""
+    return get_summary(conn, "project", project_path, level=2)
+
+
+def get_portfolio_summary(conn: sqlite3.Connection) -> dict | None:
+    """Convenience: get the L3 portfolio rollup."""
+    return get_summary(conn, "portfolio", "global", level=3)
+
+
+def list_stale_projects(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+) -> list[dict]:
+    """Find projects whose L2 summary is older than their latest session activity.
+
+    Returns projects that need L2 regeneration.
+    """
+    rows = conn.execute(
+        """SELECT p.id, p.path, p.name, p.session_count, p.last_activity,
+                  s.updated_at AS summary_updated
+           FROM projects p
+           LEFT JOIN summary_levels s
+               ON s.entity_id = p.path AND s.entity_type = 'project' AND s.level = 2
+           WHERE s.id IS NULL
+              OR s.updated_at < p.last_activity
+           ORDER BY p.last_activity DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "path": r[1], "name": r[2],
+            "session_count": r[3], "last_activity": r[4],
+            "summary_updated": r[5],
+        }
+        for r in rows
+    ]

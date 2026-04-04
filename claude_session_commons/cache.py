@@ -1,8 +1,9 @@
-"""Mtime-based session cache.
+"""Size-bucketed session cache.
 
-One JSON file per session, keyed on cache_key = md5(path:mtime).
-When the JSONL file changes, the cache key invalidates and stale
-fields are ignored on next read.
+One JSON file per session, keyed on cache_key = md5(path:size_bucket).
+Size is bucketed so that small appends (new messages in an active session)
+don't invalidate cached summaries. The cache refreshes when the session
+grows meaningfully (>10% or >50KB beyond what was cached).
 
 Fields independent of cache_key (persist across changes):
     last_seen — timestamp of last TUI view (for cooldown/dedup)
@@ -29,13 +30,37 @@ class SessionCache:
         self._dir = cache_dir or (CLAUDE_DIR / "session-cache")
         self._dir.mkdir(parents=True, exist_ok=True)
 
+    # Minimum growth (bytes) before cache invalidates. Prevents active sessions
+    # from busting cache on every new message while still refreshing when the
+    # session has grown meaningfully.
+    _MIN_GROWTH_BYTES = 51_200  # 50 KB
+    _MIN_GROWTH_RATIO = 0.10    # 10%
+
     def cache_key(self, session_file: Path) -> str:
-        """Create invalidation key from path + mtime."""
+        """Create invalidation key from path + bucketed file size.
+
+        Buckets the file size so that small appends (a few new messages)
+        don't change the key. The cache refreshes when the file has grown
+        by >50KB or >10% beyond the bucket boundary — whichever is larger.
+        """
         try:
-            mtime = session_file.stat().st_mtime
+            size = session_file.stat().st_size
         except OSError:
-            mtime = 0
-        return hashlib.md5(f"{session_file}:{mtime}".encode()).hexdigest()
+            size = 0
+        bucket = self._size_bucket(size)
+        return hashlib.md5(f"{session_file}:{bucket}".encode()).hexdigest()
+
+    @classmethod
+    def _size_bucket(cls, size: int) -> int:
+        """Round size down to a bucket boundary.
+
+        Bucket width = max(50KB, 10% of size). This means:
+        - 100KB file → bucket width 50KB → invalidates at 150KB
+        - 1MB file   → bucket width 100KB → invalidates at 1.1MB
+        - 10MB file  → bucket width 1MB   → invalidates at 11MB
+        """
+        width = max(cls._MIN_GROWTH_BYTES, int(size * cls._MIN_GROWTH_RATIO))
+        return (size // width) * width
 
     # Fields that persist across cache_key changes.
     # - Human-authored fields (bookmark, last_seen) persist because the user wrote them.

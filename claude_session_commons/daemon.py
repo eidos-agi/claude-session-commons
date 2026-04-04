@@ -28,6 +28,13 @@ from .git_context import get_git_context, get_git_anchor
 from .parse import parse_session
 from .summarize import analyze_patterns, summarize_deep, summarize_quick
 
+# Hierarchy (optional — generates L2 project summaries)
+try:
+    from .hierarchy import generate_project_summary
+    HAS_HIERARCHY = True
+except ImportError:
+    HAS_HIERARCHY = False
+
 # Local LLM for fast window summaries (optional — requires claude-resume[local])
 _local_llm_generate = None
 try:
@@ -53,6 +60,7 @@ STATUS_FILE = CLAUDE_DIR / "daemon.status.json"
 RESUME_CACHE_DIR = CLAUDE_DIR / "resume-summaries"
 TASK_DIR = CLAUDE_DIR / "daemon-tasks"
 INSIGHTS_SKIP_FILE = CLAUDE_DIR / "insights-skip.json"
+HUD_SOCKET_PATH = "/tmp/resume-hud.sock"
 
 IDLE_THRESHOLD_SECS = 300       # 5 minutes — don't process active sessions
 POLL_INTERVAL_SECS = 300        # 5 minutes between scans
@@ -1041,6 +1049,104 @@ def _stop_web_child(logger: logging.Logger):
     _web_child = None
 
 
+# ── HUD progress bridge ────────────────────────────────────
+
+import select as _select_mod
+import socket as _socket_mod
+import subprocess as _subprocess_mod
+
+_hud_fifo = None  # type: ignore[assignment]  # file handle for FIFO writes
+
+
+_hud_pid: int | None = None
+
+
+def _hud_process_alive() -> bool:
+    """Check if a HUD process with a listening socket exists."""
+    pid_path = Path("/tmp/resume-hud.pid")
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _start_hud_bridge(shutdown: threading.Event, logger: logging.Logger):
+    """Start a Unix socket listener that bridges MCP progress events to the HUD.
+
+    MCP tools connect to the socket and write JSON-lines. This thread
+    reads them and forwards to the HUD subprocess's stdin (which the
+    HUD renders via WKWebView).
+    """
+    sock_path = Path(HUD_SOCKET_PATH)
+    sock_path.unlink(missing_ok=True)
+
+    server = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(5)
+    server.setblocking(False)
+    logger.info("HUD bridge listening on %s", HUD_SOCKET_PATH)
+
+    # The bridge acts as a fan-out relay: MCP tools connect as writers,
+    # the HUD process connects as a reader. Both sides use the same socket.
+    # The HUD is spawned by the MCP server (which has GUI access), not the daemon.
+    clients: list[_socket_mod.socket] = []
+    buffers: dict[_socket_mod.socket, bytes] = {}
+    hud_writers: list[_socket_mod.socket] = []  # connections from HUD for reading
+
+    while not shutdown.is_set():
+        readable = [server] + clients
+        try:
+            ready, _, _ = _select_mod.select(readable, [], [], 1.0)
+        except (ValueError, OSError):
+            break
+
+        for sock in ready:
+            if sock is server:
+                conn, _ = server.accept()
+                conn.setblocking(False)
+                clients.append(conn)
+                buffers[conn] = b""
+            else:
+                try:
+                    data = sock.recv(4096)
+                except (ConnectionResetError, OSError):
+                    data = b""
+
+                if not data:
+                    clients.remove(sock)
+                    del buffers[sock]
+                    sock.close()
+                    continue
+
+                buffers[sock] += data
+                while b"\n" in buffers[sock]:
+                    line, buffers[sock] = buffers[sock].split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Fan out to ALL other connected clients (HUD reads from here)
+                    dead = []
+                    for c in clients:
+                        if c is sock:
+                            continue
+                        try:
+                            c.sendall(line + b"\n")
+                        except (BrokenPipeError, OSError):
+                            dead.append(c)
+                    for d in dead:
+                        clients.remove(d)
+                        del buffers[d]
+                        d.close()
+
+    server.close()
+    sock_path.unlink(missing_ok=True)
+    logger.info("HUD bridge stopped")
+
+
 # ── Main loop ────────────────────────────────────────────────
 
 def _run_loop(shutdown: threading.Event, logger: logging.Logger):
@@ -1090,6 +1196,13 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
 
     # Start web child (claude-resume-duet) — managed subprocess
     _start_web_child(logger)
+
+    # Start HUD progress bridge (Unix socket → HUD subprocess)
+    hud_thread = threading.Thread(
+        target=_start_hud_bridge, args=(shutdown, logger),
+        name="hud-bridge", daemon=True,
+    )
+    hud_thread.start()
 
     logger.info(
         "Daemon started (pid=%d, poll=%ds, idle=%ds, llm=%s)",
@@ -1240,6 +1353,46 @@ def _run_loop(shutdown: threading.Event, logger: logging.Logger):
                 if queued:
                     logger.info("Backfill: queued %d sessions for window summaries (queue: %d)",
                                 queued, llm_queue_depth())
+
+            # Priority 5: Generate L2 project summaries for stale projects
+            if _insights_ok and HAS_HIERARCHY and not shutdown.is_set():
+                try:
+                    ic = get_db()
+                    from .insights import list_stale_projects
+                    stale = list_stale_projects(ic, limit=3)
+                    ic.close()
+                    ic = None
+
+                    if stale:
+                        logger.info("L2 summaries: %d stale projects", len(stale))
+                        for proj in stale:
+                            if shutdown.is_set():
+                                break
+                            ic = None
+                            try:
+                                ic = get_db()
+                                result = generate_project_summary(
+                                    proj["path"], ic, cache=caches[0],
+                                )
+                                if result:
+                                    logger.info("L2 OK: %s -> %s",
+                                                proj["name"], result.get("title", "?")[:40])
+                                else:
+                                    logger.debug("L2 SKIP: %s (no data)", proj["name"])
+                            except Exception as he:
+                                logger.warning("L2 FAIL: %s -> %s", proj["name"], he)
+                            finally:
+                                if ic:
+                                    ic.close()
+                            if not shutdown.is_set():
+                                time.sleep(RATE_LIMIT_SECS)
+                except Exception as he:
+                    logger.warning("L2 cycle error: %s", he)
+                    if ic:
+                        try:
+                            ic.close()
+                        except Exception:
+                            pass
 
             _DAEMON_STATUS["llm_queue_depth"] = llm_queue_depth()
             _DAEMON_STATUS["state"] = "idle"
